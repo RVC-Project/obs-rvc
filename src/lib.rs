@@ -1,11 +1,11 @@
 mod rvc;
 mod rt_utils;
 
-use ndarray::s;
+use ndarray::{s, ArrayView1};
 use parking_lot::{Condvar, FairMutex, Mutex};
 use rubato::{FftFixedInOut, Resampler};
 use rvc::RvcInfer;
-use rt_utils::{get_sola_offset, upmix_audio_data, upmix_audio_data_context};
+use rt_utils::{envelop_mixing, get_sola_offset, upmix_audio_data, upmix_audio_data_context};
 
 use obs_wrapper::{media::audio, obs_register_module, obs_string, prelude::*, properties::{NumberProp, PathProp, PathType, Properties}, source::*};
 
@@ -529,8 +529,6 @@ impl FilterAudioSource for RvcInferenceFilter {
 }
 
 fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> ndarray::Array1<f32> {
-    let now = Instant::now();
-
     // move and append the last n samples
     {
         let input_buffer_retaining = state.input_buffer.len() - state.sample_frame_size;
@@ -563,8 +561,7 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
     ).unwrap();
 
     // inference
-    // let output = state.engine.infer(input_buffer_16k_view).unwrap();
-    let output = ndarray::Array1::zeros(state.model_return_size);
+    let output = state.engine.infer(input_buffer_16k_view).unwrap();
 
     let mut output = {
         let output = output.into_raw_vec();
@@ -580,11 +577,9 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
         ).unwrap()
     };
 
-    // let output = match self.rms_mix_rate < 1. {
-    //     true => 
-    //         envelop_mixing(&self.input_buffer[self.extra_frame_size..], output, self.sample_rate, self.rms_mix_rate),
-    //     false => output,
-    // };
+   if state.rms_mix_rate < 1. {
+        envelop_mixing(ArrayView1::from(&state.input_buffer[state.extra_frame_size..]), output.view_mut(), state.sample_rate, state.rms_mix_rate)
+   }
 
     // sola 
     let sola_offset = get_sola_offset(input_buffer_view, state.sola_buffer.view(), 

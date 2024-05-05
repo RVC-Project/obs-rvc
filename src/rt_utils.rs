@@ -1,4 +1,6 @@
-use ndarray::s;
+use std::mem::MaybeUninit;
+
+use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, IntoNdProducer, Zip};
 use ndarray_conv::ConvFFTExt as _;
 use obs_wrapper::media::{AudioData, AudioDataContext};
 
@@ -97,3 +99,72 @@ pub fn get_sola_offset(input_buffer: ndarray::ArrayView1<f32>, sola_buffer: ndar
     Ok(idx_max)
 }
 
+
+fn rms(y: ArrayView1<f32>, frame_length: usize, hop_length: usize) -> Array1<f32> {
+    let padding = frame_length / 2;
+    let y_padded = ndarray::concatenate![Axis(0), Array1::zeros(padding), y, Array1::zeros(padding)].mapv(|x| x.powi(2));
+    let y_mean = y_padded
+        .windows((frame_length,))
+        .into_iter()
+        .step_by(hop_length)
+        .map(|f| f.mean().unwrap().sqrt());
+    y_mean.collect()
+}
+
+fn linear_interpolate_align_corners(input: ArrayView1<f32>, size: usize) -> Array1<f32> {
+    let mut output = Array1::zeros(size);
+    let step = (input.len() - 1) as f32 / (size - 1) as f32;
+
+    Zip::indexed(output.view_mut()).for_each(|idx, val| {
+        let idx = idx as f32 * step;
+        let idx_floor = idx.floor() as usize;
+        let idx_ceil = idx.ceil() as usize;
+        let idx_frac = idx - idx_floor as f32;
+        *val = input[idx_floor] * (1.0 - idx_frac) + input[idx_ceil] * idx_frac;
+    });
+
+    output
+}
+
+pub fn envelop_mixing(input: ArrayView1<f32>, output: ArrayViewMut1<f32>, sample_rate: usize, mix_rate: f64) {
+    let zc = sample_rate / 100;
+    let output_len = output.len();
+    let rms1 = rms(input.slice(s![..output_len]), 4*zc, zc);
+    let rms2 = rms(output.view(), 4*zc, zc);
+    let rms1 = linear_interpolate_align_corners(rms1.view(), output_len + 1);
+    let rms2 = linear_interpolate_align_corners(rms2.view(), output_len + 1)
+        .mapv(|x| f32::max(x, 1e-3));
+    let mix_power = 1.0f64 - mix_rate;
+    Zip::from(output).and(rms1.slice(s![..output_len])).and(rms2.slice(s![..output_len]))
+        .for_each(|out, rms1, rms2| {
+            *out = *out * (rms1 / rms2).powf(mix_power as f32);
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rms() {
+        let y = Array1::from(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]);
+        let frame_length = 4;
+        let hop_length = 2;
+        let expected_rms = Array1::from(vec![1.118034, 2.738613, 4.6368093, 6.595453, 8.573215, 6.726812]);
+
+        let rms_values = rms(y.view(), frame_length, hop_length);
+
+        assert_eq!(rms_values, expected_rms);
+    }
+
+    #[test]
+    fn test_linear_interpolate_align_corners() {
+        let input = Array1::from(vec![0.2353, 0.9068, 0.7870, 0.5878, 0.0097, 0.7160, 0.5812, 0.8901, 0.8822, 0.8547]);
+        let expected_output_3 = Array1::from(vec![0.2353, 0.36285, 0.8547]);
+        let expected_output_15 = Array1::from(vec![0.2353, 0.66697854, 0.8725714, 0.79555714, 0.6731714, 0.4639215, 0.09228568, 0.36285, 0.6967429, 0.6100857, 0.7135856, 0.8895357, 0.8844571, 0.8723786, 0.8547]);
+        let output_3 = linear_interpolate_align_corners(input.view(), 3);
+        let output_15 = linear_interpolate_align_corners(input.view(), 15);
+        assert_eq!(output_3, expected_output_3);
+        assert_eq!(output_15, expected_output_15);
+    }
+}
