@@ -1,0 +1,594 @@
+mod rvc;
+
+use ndarray_conv::ConvFFTExt as _;
+use rvc::RvcInfer;
+
+use obs_wrapper::{media::audio, obs_register_module, obs_string, prelude::*, properties::{NumberProp, PathProp, PathType, Properties}, source::*};
+
+use std::{borrow::Cow, collections::VecDeque, f32::consts::PI, path::PathBuf};
+
+use dasp::{
+    interpolate::sinc::Sinc, ring_buffer, signal::{self, Signal}
+};
+
+const RNNOISE_SAMPLE_RATE: f64 = 48000.;
+const WAV_COEFFICIENT: f32 = 32767.0;
+const FRAME_SIZE: usize = 480;
+
+macro_rules! get_path_from_settings {
+    ($settings:ident, $setting:ident) => {
+        if let Some(path) = $settings.get::<Cow<str>>($setting) {
+            if !path.is_empty() {
+                let path = PathBuf::from(path.to_string());
+                if path.exists() {
+                    Some(path)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    ($field:expr, $settings:ident, $setting:ident) => {
+        if let Some(path) = $settings.get::<Cow<str>>($setting) {
+            let new_path_str = path.to_string();
+            let orig_path = $field.as_ref().map(|p| p.to_str().unwrap_or(""));
+            if $field.is_none() || orig_path != Some(new_path_str.as_str()) {
+                if !path.is_empty() {
+                    let path = PathBuf::from(path.to_string());
+                    if path.exists() {
+                        $field = Some(path);
+                    } else {
+                        $field = None;
+                    }
+                    true
+                } else {
+                    $field = None;
+                    true
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
+}
+
+
+struct RvcInferenceFilter {
+    input: VecDeque<f32>,
+    output: VecDeque<f32>,
+    sample_rate: f64,
+    channels: usize,
+
+    model_path: Option<PathBuf>,
+    index_path: Option<PathBuf>,
+    model_output_sample_rate: f64,
+    pitch_shift: i32,
+    resonance_shift: f64,
+    index_rate: f64,
+    rms_mix_rate: f64,
+    sample_length: f64,
+    crossfade_length: f64,
+    extra_inference_time: f64,
+
+    sample_frame_size: usize,
+    sample_frame_16k: usize,
+    crossfade_frame_size: usize,
+    sola_buffer_frame_size: usize,
+    sola_search_frame_size: usize,
+    extra_frame_size: usize,
+
+    input_buffer: Vec<f32>,
+    input_buffer_16k: Vec<f32>,
+    sola_buffer: Vec<f32>,
+
+    fade_in_window: ndarray::Array1<f32>,
+    fade_out_window: ndarray::Array1<f32>,
+
+    state: RvcInfer,
+}
+
+struct RvcInferenceModule {
+    context: ModuleRef,
+}
+
+
+
+impl Sourceable for RvcInferenceFilter {
+    fn get_id() -> ObsString {
+        obs_string!("rvc_inference_filter")
+    }
+    fn get_type() -> SourceType {
+        SourceType::Filter
+    }
+    fn create(create: &mut CreatableSourceContext<Self>, _source: SourceRef) -> Self {
+        let (sample_rate, channels) =
+            create.with_audio(|audio| (audio.sample_rate(), audio.channels()));
+
+        let settings = &mut create.settings;
+
+        let model_path = get_path_from_settings!(settings, SETTING_MODEL_PATH);
+        let index_path = get_path_from_settings!(settings, SETTING_INDEX_PATH);
+
+        let mut rvc = RvcInfer::new();
+
+        if let Some(model_path) = model_path {
+            match rvc.load_model(model_path) {
+                Ok(_) => (),
+                Err(e) => {
+                    println!("Error loading model: {:?}", e);
+                }
+            }
+        }
+
+        settings.set_default::<i32>(SETTING_DEST_SAMPLE_RATE, 40000);
+        settings.set_default::<i32>(SETTING_PITCH_SHIFT, 12);
+        settings.set_default::<f32>(SETTING_RESONANCE_SHIFT, 0.07);
+        settings.set_default::<f32>(SETTING_INDEX_RATE, 0.0);
+        settings.set_default::<f32>(SETTING_LOUDNESS_FACTOR, 0.5);
+        settings.set_default::<f32>(SETTING_SAMPLE_LENGTH, 0.30);
+        settings.set_default::<f32>(SETTING_FADE_LENGTH, 0.07);
+        settings.set_default::<f32>(SETTING_EXTRA_INFERENCE_TIME, 2.00);
+
+        let model_output_sample_rate = settings.get(SETTING_DEST_SAMPLE_RATE).unwrap_or(40000) as f64;
+        let sample_length = settings.get(SETTING_SAMPLE_LENGTH).unwrap_or(0.30);
+        let crossfade_length = settings.get(SETTING_FADE_LENGTH).unwrap_or(0.07);
+        let extra_inference_time = settings.get(SETTING_EXTRA_INFERENCE_TIME).unwrap_or(2.00);
+
+        let zc = sample_rate / 100;
+
+        let sample_frame_time = (sample_length * sample_rate as f64 / zc as f64).round() as usize;
+        let sample_frame_size = sample_frame_time * zc;
+        let sample_frame_16k = sample_frame_time * 160;
+        let crossfade_frame_size = (crossfade_length * sample_rate as f64 / zc as f64).round() as usize * zc;
+        let sola_buffer_frame_size = usize::min(crossfade_frame_size, 4 * zc);
+        let sola_search_frame_size = zc;
+        let extra_frame_size = (extra_inference_time * sample_rate as f64 / zc as f64).round() as usize * zc;
+
+        let input_buffer_size = extra_frame_size + crossfade_frame_size + sola_search_frame_size + sample_frame_size;
+        let mut input_buffer = Vec::with_capacity(input_buffer_size);
+        input_buffer.fill(0_f32);
+
+        let input_buffer_16k_size = 160 * input_buffer_size / zc;
+        let mut input_buffer_16k = Vec::with_capacity(input_buffer_size);
+        input_buffer_16k.fill(0_f32);
+        let mut sola_buffer = Vec::with_capacity(sola_buffer_frame_size);
+        sola_buffer.fill(0_f32);
+
+
+        let mut fade_in_window = ndarray::Array1::linspace(0.0, 1.0, sola_buffer_frame_size);
+        fade_in_window.mapv_inplace(|x| f32::sin(x * 0.5 * PI).powi(2));
+        let mut fade_out_window = fade_in_window.mapv(|x| 1.0 - x);
+
+        Self {
+            input: VecDeque::with_capacity(sample_frame_size * 3),
+            output: VecDeque::with_capacity(sample_frame_size * 3),
+            sample_rate: sample_rate as f64,
+            channels,
+
+            model_path,
+            index_path,
+            model_output_sample_rate,
+            pitch_shift: settings.get(SETTING_PITCH_SHIFT).unwrap_or(12),
+            resonance_shift: settings.get(SETTING_RESONANCE_SHIFT).unwrap_or(0.00),
+            index_rate: settings.get(SETTING_INDEX_RATE).unwrap_or(0.00),
+            rms_mix_rate: settings.get(SETTING_LOUDNESS_FACTOR).unwrap_or(0.00),
+            sample_length,
+            crossfade_length,
+            extra_inference_time,
+
+            sample_frame_size,
+            sample_frame_16k,
+            crossfade_frame_size,
+            sola_buffer_frame_size,
+            sola_search_frame_size,
+            extra_frame_size,
+
+            input_buffer,
+            input_buffer_16k,
+            sola_buffer,
+
+            fade_in_window,
+            fade_out_window,
+
+            state: rvc,
+        }
+    }
+}
+
+impl GetNameSource for RvcInferenceFilter {
+    fn get_name() -> ObsString {
+        obs_string!("Retrieval Voice Conversion")
+    }
+}
+
+const SETTING_MODEL_PATH: ObsString = obs_string!("model_path");
+const SETTING_INDEX_PATH: ObsString = obs_string!("index_path");
+const SETTING_PITCH_SHIFT: ObsString = obs_string!("pitch_shift");
+const SETTING_RESONANCE_SHIFT: ObsString = obs_string!("resonance_shift");
+const SETTING_INDEX_RATE: ObsString = obs_string!("index_rate");
+const SETTING_LOUDNESS_FACTOR: ObsString = obs_string!("loudness_factor");
+// const SETTING_PITCH_ALGORITHM: ObsString = obs_string!("pitch_algorithm");
+const SETTING_SAMPLE_LENGTH: ObsString = obs_string!("sample_length");
+const SETTING_FADE_LENGTH: ObsString = obs_string!("fade_length");
+const SETTING_EXTRA_INFERENCE_TIME: ObsString = obs_string!("extra_inference_time");
+const SETTING_DEST_SAMPLE_RATE: ObsString = obs_string!("dest_sample_rate");
+
+
+impl GetPropertiesSource for RvcInferenceFilter {
+    fn get_properties(&mut self) -> Properties {
+        let mut p = Properties::new();
+    
+        p.add(
+            SETTING_MODEL_PATH, 
+            obs_string!("模型路径"), 
+            PathProp::new(PathType::File).with_filter(obs_string!("ONNX 模型文件 (*.onnx)"))
+        );
+
+        p.add(
+            SETTING_INDEX_PATH,
+            obs_string!("RVC 音高索引文件路径"), 
+            PathProp::new(PathType::File).with_filter(obs_string!("Index 文件 (*.index)"))
+        );
+
+        p.add(
+            SETTING_DEST_SAMPLE_RATE,
+            obs_string!("模型目标采样率"),
+            NumberProp::new_int().with_range(16000..=48000).with_step(4000).with_slider()
+        );
+
+        p.add(
+            SETTING_PITCH_SHIFT, 
+            obs_string!("音调设置"),
+            NumberProp::new_int().with_range(-24..=24).with_step(1).with_slider()
+        );
+
+        p.add(
+            SETTING_RESONANCE_SHIFT, 
+            obs_string!("共振偏移"),
+            NumberProp::new_float(0.07).with_range(-5.0..=5.0).with_slider()
+        );
+
+        p.add(
+            SETTING_INDEX_RATE, 
+            obs_string!("索引率"), 
+            NumberProp::new_float(0.01).with_range(0.00..=1.00).with_slider()
+        );
+
+        p.add(
+            SETTING_LOUDNESS_FACTOR, 
+            obs_string!("响度因子"), 
+            NumberProp::new_float(0.01).with_range(0.00..=1.00).with_slider()
+        );
+
+        p.add(
+            SETTING_SAMPLE_LENGTH, 
+            obs_string!("采样长度"), 
+            NumberProp::new_float(0.01).with_range(0.01..=0.15).with_slider()
+        );
+
+
+        p.add(
+            SETTING_FADE_LENGTH, 
+            obs_string!("淡入淡出长度"), 
+            NumberProp::new_float(0.01).with_range(0.01..=0.15).with_slider()
+        );
+
+        p.add(
+            SETTING_EXTRA_INFERENCE_TIME, 
+            obs_string!("额外推理时长"), 
+            NumberProp::new_float(0.01).with_range(0.00..=1.00).with_slider()
+        );
+
+        p
+    }
+}
+
+impl UpdateSource for RvcInferenceFilter {
+    fn update(&mut self, settings: &mut DataObj, context: &mut GlobalContext) {
+        let sample_rate = context.with_audio(|audio| audio.sample_rate());
+        self.sample_rate = sample_rate as f64;
+
+        let model_changed = get_path_from_settings!(self.model_path, settings, SETTING_MODEL_PATH);
+        get_path_from_settings!(self.index_path, settings, SETTING_INDEX_PATH);
+
+        let mut recalculate_input_buffer = false;
+
+        if let Some(new_pitch_shift) = settings.get(SETTING_PITCH_SHIFT) {
+            if self.pitch_shift != new_pitch_shift {
+                self.pitch_shift = new_pitch_shift;
+            }
+        }
+
+        if let Some(new_resonance_shift) = settings.get(SETTING_RESONANCE_SHIFT) {
+            if self.resonance_shift != new_resonance_shift {
+                self.resonance_shift = new_resonance_shift;
+            }
+        }
+
+        if let Some(new_index_rate) = settings.get(SETTING_INDEX_RATE) {
+            if self.index_rate != new_index_rate {
+                self.index_rate = new_index_rate;
+            }
+        }
+
+        if let Some(new_rms_mix_rate) = settings.get(SETTING_LOUDNESS_FACTOR) {
+            if self.rms_mix_rate != new_rms_mix_rate {
+                self.rms_mix_rate = new_rms_mix_rate;
+            }
+        }
+
+        if let Some(new_sample_length) = settings.get(SETTING_SAMPLE_LENGTH) {
+            if self.sample_length != new_sample_length {
+                self.sample_length = new_sample_length;
+                recalculate_input_buffer = true;
+            }
+        }
+
+        if let Some(new_fade_length) = settings.get(SETTING_FADE_LENGTH) {
+            if self.crossfade_length != new_fade_length {
+                self.crossfade_length = new_fade_length;
+                recalculate_input_buffer = true;
+            }
+        }
+
+        if let Some(new_extra_inference_time) = settings.get(SETTING_EXTRA_INFERENCE_TIME) {
+            if self.extra_inference_time != new_extra_inference_time {
+                self.extra_inference_time = new_extra_inference_time;
+                recalculate_input_buffer = true;
+            }
+        }
+
+        if let Some(new_dest_sample_rate) = settings.get(SETTING_DEST_SAMPLE_RATE) {
+            if self.model_output_sample_rate != new_dest_sample_rate {
+                self.model_output_sample_rate = new_dest_sample_rate;
+            }
+        }
+
+        if model_changed {
+            match self.model_path {
+                Some(ref path) => {
+                    match self.state.load_model(path) {
+                        Ok(_) => (),
+                        Err(e) => {
+                            println!("Error loading model: {:?}", e);
+                        }
+                    }
+                }
+                None => {
+                    self.state.unload_model();
+                }
+            }
+        }
+
+
+        if recalculate_input_buffer {
+            let sample_length = self.sample_length;
+            let crossfade_length = self.crossfade_length;
+            let extra_inference_time = self.extra_inference_time;
+
+            // zc is sample per 0.1 sec
+            let zc = sample_rate / 100;
+
+            let sample_frame_time = (sample_length * sample_rate as f64 / zc as f64).round() as usize;
+            let sample_frame_size = sample_frame_time * zc;
+            let sample_frame_16k = sample_frame_time * 160;
+            let crossfade_frame_size = (crossfade_length * sample_rate as f64 / zc as f64).round() as usize * zc;
+            let sola_buffer_frame_size = usize::min(crossfade_frame_size, 4 * zc);
+            let sola_search_frame_size = zc;
+            let extra_frame_size = (extra_inference_time * sample_rate as f64 / zc as f64).round() as usize * zc;
+
+            self.sample_frame_size = sample_frame_size;
+            self.sample_frame_16k = sample_frame_16k;
+            self.crossfade_frame_size = crossfade_frame_size;
+            self.sola_buffer_frame_size = sola_buffer_frame_size;
+            self.sola_search_frame_size = sola_search_frame_size;
+            self.extra_frame_size = extra_frame_size;
+
+            let input_buffer_size = extra_frame_size + crossfade_frame_size + sola_search_frame_size + sample_frame_size;
+            self.input_buffer.resize(input_buffer_size, 0_f32);
+
+            let input_buffer_16k_size = 160 * input_buffer_size / zc;
+            self.input_buffer_16k.resize(input_buffer_16k_size, 0_f32);
+
+            let mut fade_in_window = ndarray::Array1::linspace(0.0, 1.0, sola_buffer_frame_size);
+            fade_in_window.mapv_inplace(|x| f32::sin(x * 0.5 * PI).powi(2));
+            let mut fade_out_window = fade_in_window.mapv(|x| 1.0 - x);
+
+            self.fade_in_window = fade_in_window;
+            self.fade_out_window = fade_out_window;
+        }
+        
+    }
+}
+
+impl FilterAudioSource for RvcInferenceFilter {
+    fn filter_audio(&mut self, audio: &mut audio::AudioDataContext) {
+        let data = self;
+
+        let input_ring_buffer = &mut data.input;
+        let output_state = &mut data.output;
+
+        if let Some(base) = audio.get_channel_as_mut_slice(0) {
+
+            // To mono
+            for channel in 1..data.channels {
+                let buffer = audio
+                    .get_channel_as_mut_slice(channel)
+                    .expect("Channel count said there was a buffer here.");
+
+                for (output, input) in base.iter_mut().zip(buffer.iter()) {
+                    *output = *output * 0.5 + *input * 0.5;
+                }
+            }
+
+            // chunk by sample length
+            let audio_chunks = base.chunks_mut(self.sample_frame_size);
+
+            for buffer in audio_chunks {
+                for sample in buffer.iter() {
+                    input_ring_buffer.push_back(*sample);
+                }
+
+                let output_buffer = &mut output_state.buffer;
+
+                // buffer already contains 1 sample
+                if input_ring_buffer.len() >= self.sample_frame_size {
+
+                    // move and append the last n samples
+                    {
+                        self.input_buffer.copy_within(self.sample_frame_size.., 0);
+                        let input_last_n = self.input_buffer.len() - self.sample_frame_size;
+                        for (i, sample) in input_ring_buffer.iter().take(self.sample_frame_size).enumerate() {
+                            self.input_buffer[input_last_n + i] = *sample;
+                        }
+                        input_ring_buffer.drain(..self.sample_frame_size);
+                    }
+
+                    // resample and set to 16k
+                    {
+                        self.input_buffer_16k.copy_within(self.sample_frame_16k.., 0);
+                        let resample_left_bound = self.input_buffer.len() - self.sample_frame_size - (self.sample_rate as usize / 50);
+                        let signal = signal::from_interleaved_samples_iter(self.input_buffer[resample_left_bound..].iter().cloned());
+                        let ring_buffer = ring_buffer::Fixed::from([[0.0]; 100]);
+                        let sinc = Sinc::new(ring_buffer);
+                        let new_signal = signal.from_hz_to_hz(sinc, self.sample_rate, 16000_f64);
+
+                        let input_buffer_16k_last_n = self.input_buffer_16k.len() - self.sample_frame_16k;
+                        for (i, sample) in new_signal.until_exhausted().skip(160).enumerate() {
+                            self.input_buffer_16k[input_buffer_16k_last_n + i] = sample[0];
+                        }
+                    }
+
+                    // inference
+                    let output = self.state.infer(input, self.sample_frame_16k).unwrap();
+
+                    // resample back
+                    let output = {
+                        let signal = signal::from_interleaved_samples_iter(output);
+                        let ring_buffer = ring_buffer::Fixed::from([[0.0]; 100]);
+                        let sinc = Sinc::new(ring_buffer);
+                        let new_signal = signal.from_hz_to_hz(sinc, self.model_output_sample_rate, self.sample_rate);
+                        let new_signal_vec = new_signal.until_exhausted().collect::<Vec<f32>>();
+                        ndarray::Array1::from(new_signal_vec)
+                    };
+
+                    let output = match self.rms_mix_rate < 1. {
+                        true => 
+                            envelop_mixing(&self.input_buffer[self.extra_frame_size..], output, self.sample_rate, self.rms_mix_rate)
+                        false => output,
+                    };
+
+                    // sola 
+                    let sola_offset = {
+                        let conv_input_size = self.sola_buffer_frame_size + self.sola_search_frame_size;
+                        let conv_input = ndarray::ArrayView3::from_shape(
+                            (1, 1, conv_input_size,), &self.input_buffer[..conv_input_size]
+                        ).unwrap();
+
+                        let sola_buffer_view = ndarray::ArrayView3::from_shape(
+                            (1, 1, self.sola_buffer_frame_size,), &mut self.sola_buffer
+                        ).unwrap();
+
+                        let cor_num = conv_input.conv_fft(
+                            &sola_buffer_view, ndarray_conv::ConvMode::Full, 
+                            ndarray_conv::PaddingMode::Zeros
+                        ).unwrap();
+
+                        let cor_den_filler = ndarray::Array3::<f32>::ones((1, 1, self.sola_buffer_frame_size));
+                        let conv_input_squared = conv_input.mapv(|x| x * x);
+                        let mut cor_den = conv_input_squared.conv_fft(
+                            &cor_den_filler, ndarray_conv::ConvMode::Full, 
+                            ndarray_conv::PaddingMode::Zeros
+                        ).unwrap();
+                        cor_den.mapv_inplace(|x| (x + 1e-8).sqrt());
+                        
+                        let cor_num_1d = cor_num.into_shape(cor_num.len()).unwrap();
+                        let cor_den_1d = cor_den.into_shape(cor_den.len()).unwrap();
+                        let cor = cor_num_1d / cor_den_1d;
+                        let (idx_max, val_max) =
+                            cor.iter()
+                                .enumerate()
+                                .fold((0, cor[0]), |(idx_max, val_max), (idx, val)| {
+                                    if &val_max > val {
+                                        (idx_max, val_max)
+                                    } else {
+                                        (idx, *val)
+                                    }
+                                });
+                        idx_max
+                    };
+
+                    let output = output[sola_offset..];
+
+                    // TODO: phase vocoder
+                    {
+                        output[..self.sola_buffer_frame_size] *= self.fade_in_window;
+
+                        let sola_buffer_view = ndarray::ArrayView1::from_shape(
+                            (self.sola_buffer_frame_size,), &self.sola_buffer
+                        ).unwrap();
+
+                        output[..self.sola_buffer_frame_size] += &sola_buffer_view * self.fade_out_window;
+                    }
+
+                    self.sola_buffer.copy_from_slice(&output[self.sample_frame_size..(self.sample_frame_size + self.sola_buffer_frame_size)]);
+
+                    output_buffer.extend(output);
+                }
+
+            }
+
+            for channel in 1..data.channels {
+                let buffer = audio
+                    .get_channel_as_mut_slice(channel)
+                    .expect("Channel count said there was a buffer here.");
+
+                for (output, input) in buffer.iter_mut().zip(base.iter()) {
+                    *output = *input;
+                }
+            }
+        }
+    }
+}
+
+impl Module for RvcInferenceModule {
+    fn new(context: ModuleRef) -> Self {
+        Self { context }
+    }
+    fn get_ctx(&self) -> &ModuleRef {
+        &self.context
+    }
+
+    fn load(&mut self, load_context: &mut LoadContext) -> bool {
+        let source = load_context
+            .create_source_builder::<RvcInferenceFilter>()
+            .enable_get_name()
+            .enable_update()
+            .enable_get_properties()
+            .enable_filter_audio()
+            .build();
+
+        load_context.register_source(source);
+
+        true
+    }
+
+    fn description() -> ObsString {
+        obs_string!("A filter that uses Retrieval-based Voice Conversion to change your voice.")
+    }
+    fn name() -> ObsString {
+        obs_string!("Retrieval Voice Conversion")
+    }
+    fn author() -> ObsString {
+        obs_string!("Joe")
+    }
+}
+
+obs_register_module!(RvcInferenceModule);

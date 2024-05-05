@@ -1,0 +1,3 @@
+[submodule "vendor/obs-wrapper"]
+	path = vendor/obs-wrapper
+	url = git@github.com:wfjsw/rust-obs-plugins.git
