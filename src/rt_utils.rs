@@ -1,6 +1,4 @@
-use std::mem::MaybeUninit;
-
-use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, IntoNdProducer, Zip};
+use ndarray::{s, Array1, ArrayView1, ArrayViewMut1, Axis, Zip};
 use ndarray_conv::ConvFFTExt as _;
 use obs_wrapper::media::{AudioData, AudioDataContext};
 
