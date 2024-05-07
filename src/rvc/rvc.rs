@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 
-use ndarray::Axis;
+use ndarray::{s, Axis};
 use ort::Session;
 
 use super::{
     enums::{PitchAlgorithm, RvcModelVersion},
     errors::RvcInferError,
+    f0::{rmvpe::Rmvpe, F0Algorithm},
     models::{load_contentvec_from_file, load_f0_from_file, load_model_from_file},
 };
 
@@ -14,7 +15,6 @@ pub struct RvcInfer {
     session: Option<Session>,
     contentvec_session: Option<Session>,
     f0_algorithm: Option<PitchAlgorithm>,
-    f0_session: Option<Session>,
 }
 
 impl RvcInfer {
@@ -24,7 +24,6 @@ impl RvcInfer {
             session: None,
             contentvec_session: None,
             f0_algorithm: None,
-            f0_session: None,
         }
     }
 
@@ -45,12 +44,20 @@ impl RvcInfer {
     }
 
     pub fn load_f0(&mut self, pitch_algorithm: PitchAlgorithm) -> Result<(), ort::Error> {
-        self.f0_session = Some(load_f0_from_file(
-            self.data_path.join("f0"),
-            self.data_path.join("cache"),
-            pitch_algorithm,
-        )?);
-        self.f0_algorithm = Some(pitch_algorithm);
+        match pitch_algorithm {
+            PitchAlgorithm::Rmvpe(Some(rmvpe)) => {
+                self.f0_algorithm = Some(PitchAlgorithm::Rmvpe(Some(rmvpe)));
+            }
+            PitchAlgorithm::Rmvpe(None) => {
+                let f0_session = Some(load_f0_from_file(
+                    self.data_path.join("f0"),
+                    self.data_path.join("cache"),
+                    pitch_algorithm,
+                )?);
+                self.f0_algorithm =
+                    Some(PitchAlgorithm::Rmvpe(Some(Rmvpe::new(f0_session.unwrap()))));
+            }
+        }
         Ok(())
     }
 
@@ -79,15 +86,24 @@ impl RvcInfer {
     pub fn pitch(
         &self,
         input: ndarray::ArrayView1<f32>,
-        pitch_shift: f64,
+        pitch_shift: i32,
         sample_frame_16k_size: usize,
-    ) {
+    ) -> Result<(), ()> {
+        // return pitch, pitchf
+
+        match self.f0_algorithm {
+            Some(PitchAlgorithm::Rmvpe(Some(rmvpe))) => {
+                rmvpe.pitch(input, pitch_shift, sample_frame_16k_size)
+            }
+            _ => Err(()),
+        }
     }
 
     pub fn infer(
         &self,
         input: ndarray::ArrayView1<f32>,
         sample_frame_16k_size: usize,
+        pitch_shift: Option<i32>,
     ) -> Result<ndarray::Array1<f32>, RvcInferError> {
         if self.session.is_none() {
             return Err(RvcInferError::ModelNotLoaded);
@@ -98,7 +114,9 @@ impl RvcInfer {
 
         // TODO: index search
 
-        // f0
+        // if f0
+        let pitch_shift = pitch_shift.unwrap_or(0);
+        let (pitch, pitchf) = self.pitch(input, pitch_shift, sample_frame_16k_size);
 
         Ok(ndarray::Array1::zeros(1))
     }

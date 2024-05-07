@@ -176,7 +176,7 @@ impl Sourceable for RvcInferenceFilter {
         settings.set_default::<f32>(SETTING_FADE_LENGTH, 0.07);
         settings.set_default::<f32>(SETTING_EXTRA_INFERENCE_TIME, 2.00);
         settings.set_default::<RvcModelVersion>(SETTING_MODEL_VERSION, RvcModelVersion::V2);
-        settings.set_default::<PitchAlgorithm>(SETTING_PITCH_ALGORITHM, PitchAlgorithm::Rmvpe);
+        settings.set_default::<PitchAlgorithm>(SETTING_PITCH_ALGORITHM, PitchAlgorithm::Rmvpe(None));
 
         let model_output_sample_rate = settings.get(SETTING_DEST_SAMPLE_RATE).unwrap_or(40000);
         let sample_length = settings.get(SETTING_SAMPLE_LENGTH).unwrap_or(0.30);
@@ -187,7 +187,7 @@ impl Sourceable for RvcInferenceFilter {
             .unwrap_or(RvcModelVersion::V2);
         let pitch_algorithm = settings
             .get(SETTING_PITCH_ALGORITHM)
-            .unwrap_or(PitchAlgorithm::Rmvpe);
+            .unwrap_or(PitchAlgorithm::Rmvpe(None));
 
         let zc = sample_rate / 100;
 
@@ -353,7 +353,7 @@ impl GetPropertiesSource for RvcInferenceFilter {
         let mut pitch_algorithm_list =
             p.add_list::<PitchAlgorithm>(SETTING_PITCH_ALGORITHM, obs_string!("音高算法"), false);
 
-        pitch_algorithm_list.push(obs_string!("RMVPE"), PitchAlgorithm::Rmvpe);
+        pitch_algorithm_list.push(obs_string!("RMVPE"), PitchAlgorithm::Rmvpe(None));
 
         p.add(
             SETTING_PITCH_SHIFT,
@@ -675,7 +675,7 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
             .unwrap();
 
     // inference
-    let output = match state.engine.infer(input_buffer_16k_view, state.sample_frame_16k_size) {
+    let output = match state.engine.infer(input_buffer_16k_view, state.sample_frame_16k_size, Some(state.pitch_shift)) {
         Ok(output) => output,
         Err(e) => {
             println!("Error: {:?}", e);

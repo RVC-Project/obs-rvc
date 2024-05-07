@@ -47,7 +47,7 @@ pub fn load_f0_from_file(
     pitch_algoritm: PitchAlgorithm,
 ) -> Result<Session, ort::Error> {
     let filename = match pitch_algoritm {
-        PitchAlgorithm::Rmvpe => "rmvpe.onnx",
+        PitchAlgorithm::Rmvpe(_) => "rmvpe.onnx",
     };
 
     get_onnx_session(cache_path)?.commit_from_file(path.join(filename))

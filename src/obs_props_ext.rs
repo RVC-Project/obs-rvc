@@ -75,7 +75,7 @@ impl RvcModelVersion {
 impl From<PitchAlgorithm> for i64 {
     fn from(algorithm: PitchAlgorithm) -> Self {
         match algorithm {
-            PitchAlgorithm::Rmvpe => 1,
+            PitchAlgorithm::Rmvpe(_) => 1,
         }
     }
 }
@@ -83,8 +83,8 @@ impl From<PitchAlgorithm> for i64 {
 impl From<i64> for PitchAlgorithm {
     fn from(val: i64) -> Self {
         match val {
-            1 => PitchAlgorithm::Rmvpe,
-            _ => PitchAlgorithm::Rmvpe,
+            1 => PitchAlgorithm::Rmvpe(None),
+            _ => PitchAlgorithm::Rmvpe(None),
         }
     }
 }

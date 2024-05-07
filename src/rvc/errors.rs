@@ -2,6 +2,7 @@
 pub enum RvcInferError {
     ModelNotLoaded,
     ContentvecNotLoaded,
+    F0NotLoaded,
     Ort(ort::Error),
     NdarrayShapeError(ndarray::ShapeError),
 }
