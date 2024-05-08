@@ -1,12 +1,13 @@
 use std::path::{Path, PathBuf};
 
 use ndarray::{s, Axis};
+use ndarray_rand::{rand_distr::Normal, RandomExt};
 use ort::Session;
 
 use super::{
     enums::{PitchAlgorithm, RvcModelVersion},
     errors::RvcInferError,
-    f0::{rmvpe::Rmvpe, F0Algorithm},
+    f0::{get_f0_post, rmvpe::Rmvpe},
     models::{load_contentvec_from_file, load_f0_from_file, load_model_from_file},
 };
 
@@ -15,15 +16,23 @@ pub struct RvcInfer {
     session: Option<Session>,
     contentvec_session: Option<Session>,
     f0_algorithm: Option<PitchAlgorithm>,
+    f0_mel_min: f32,
+    f0_mel_max: f32,
 }
 
 impl RvcInfer {
     pub fn new(data_path: PathBuf) -> Self {
+        const F0_MIN: f32 = 50.0;
+        const F0_MAX: f32 = 500.0f32;
+        let f0_mel_min = (F0_MIN / 700.0 + 1.).ln() * 1127.;
+        let f0_mel_max = (F0_MAX / 700.0 + 1.).ln() * 1127.;
         RvcInfer {
             data_path,
             session: None,
             contentvec_session: None,
             f0_algorithm: None,
+            f0_mel_min,
+            f0_mel_max,
         }
     }
 
@@ -49,13 +58,13 @@ impl RvcInfer {
                 self.f0_algorithm = Some(PitchAlgorithm::Rmvpe(Some(rmvpe)));
             }
             PitchAlgorithm::Rmvpe(None) => {
-                let f0_session = Some(load_f0_from_file(
+                let f0_session = load_f0_from_file(
                     self.data_path.join("f0"),
                     self.data_path.join("cache"),
                     pitch_algorithm,
-                )?);
+                )?;
                 self.f0_algorithm =
-                    Some(PitchAlgorithm::Rmvpe(Some(Rmvpe::new(f0_session.unwrap()))));
+                    Some(PitchAlgorithm::Rmvpe(Some(Rmvpe::new(f0_session))));
             }
         }
         Ok(())
@@ -84,23 +93,27 @@ impl RvcInfer {
     }
 
     pub fn pitch(
-        &self,
+        &mut self,
         input: ndarray::ArrayView1<f32>,
         pitch_shift: i32,
         sample_frame_16k_size: usize,
-    ) -> Result<(), ()> {
+    ) -> Result<(ndarray::Array1<i64>, ndarray::Array1<f32>), RvcInferError> {
         // return pitch, pitchf
 
-        match self.f0_algorithm {
+        let f0 = match &mut self.f0_algorithm {
             Some(PitchAlgorithm::Rmvpe(Some(rmvpe))) => {
-                rmvpe.pitch(input, pitch_shift, sample_frame_16k_size)
+                let uppower = 2.0f32.powi(pitch_shift / 12);
+                let f0 = rmvpe.pitch(input, sample_frame_16k_size, 0.03)? * uppower;
+                f0
             }
-            _ => Err(()),
-        }
+            _ => unreachable!(),
+        };
+
+        Ok(get_f0_post(f0, self.f0_mel_min, self.f0_mel_max))
     }
 
     pub fn infer(
-        &self,
+        &mut self,
         input: ndarray::ArrayView1<f32>,
         sample_frame_16k_size: usize,
         pitch_shift: Option<i32>,
@@ -111,13 +124,35 @@ impl RvcInfer {
 
         let hubert_output = self.hubert(input)?;
         let hubert_length = hubert_output.len_of(Axis(1));
+        let hubert_length_arr = ndarray::Array1::from_vec(vec![hubert_length as i64]);
 
         // TODO: index search
 
         // if f0
         let pitch_shift = pitch_shift.unwrap_or(0);
-        let (pitch, pitchf) = self.pitch(input, pitch_shift, sample_frame_16k_size);
+        let (pitch, pitchf) = self.pitch(input, pitch_shift, sample_frame_16k_size)?;
 
-        Ok(ndarray::Array1::zeros(1))
+        let ds = 0;
+        let ds = ndarray::Array1::from_vec(vec![ds as i64]);
+        let rnd = ndarray::Array3::random((1, 192, hubert_length), Normal::from_mean_cv(0.0f32, 1.0f32).unwrap());
+
+        let session = self.session.as_ref().unwrap();
+
+        let output = session.run(ort::inputs![
+            "phone" => hubert_output, 
+            "phone_lengths" => hubert_length_arr, 
+            "pitch" => pitch,
+            "pitchf" => pitchf,
+            "ds" => ds,
+            "rnd" => rnd
+        ]?)?;
+
+        let output_tensor = output["audio"]
+            .try_extract_tensor::<f32>()?
+            .into_dimensionality::<ndarray::Ix1>()?;
+
+        let out = output_tensor.mapv(|x| x * 32767.0f32);
+
+        Ok(out)
     }
 }

@@ -35,3 +35,11 @@ impl PartialEq for PitchAlgorithm {
         }
     }
 }
+
+impl PitchAlgorithm {
+    pub fn clone_lossy(&self) -> Self {
+        match self {
+            PitchAlgorithm::Rmvpe(_) => PitchAlgorithm::Rmvpe(None),
+        }
+    }
+}

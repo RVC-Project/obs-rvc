@@ -6,7 +6,10 @@ use ndarray::{s, ArrayView1};
 use parking_lot::{Condvar, FairMutex, Mutex};
 use rt_utils::{envelop_mixing, get_sola_offset, upmix_audio_data_context};
 use rubato::{FftFixedInOut, Resampler};
-use rvc::{RvcInfer, enums::{PitchAlgorithm, RvcModelVersion}};
+use rvc::{
+    enums::{PitchAlgorithm, RvcModelVersion},
+    RvcInfer,
+};
 
 use obs_wrapper::{
     media::audio,
@@ -128,6 +131,17 @@ struct RvcInferenceState {
     engine: RvcInfer,
 }
 
+fn set_thread_panic_hook() {
+    use std::{
+        panic::{set_hook, take_hook},
+    };
+    let orig_hook = take_hook();
+    set_hook(Box::new(move |panic_info| {
+        println!("Panic: {:?}", panic_info);
+        orig_hook(panic_info);
+    }));
+}
+
 struct RvcInferenceSharedState {
     state: FairMutex<RvcInferenceState>,
     running: AtomicBool,
@@ -176,7 +190,8 @@ impl Sourceable for RvcInferenceFilter {
         settings.set_default::<f32>(SETTING_FADE_LENGTH, 0.07);
         settings.set_default::<f32>(SETTING_EXTRA_INFERENCE_TIME, 2.00);
         settings.set_default::<RvcModelVersion>(SETTING_MODEL_VERSION, RvcModelVersion::V2);
-        settings.set_default::<PitchAlgorithm>(SETTING_PITCH_ALGORITHM, PitchAlgorithm::Rmvpe(None));
+        settings
+            .set_default::<PitchAlgorithm>(SETTING_PITCH_ALGORITHM, PitchAlgorithm::Rmvpe(None));
 
         let model_output_sample_rate = settings.get(SETTING_DEST_SAMPLE_RATE).unwrap_or(40000);
         let sample_length = settings.get(SETTING_SAMPLE_LENGTH).unwrap_or(0.30);
@@ -236,7 +251,7 @@ impl Sourceable for RvcInferenceFilter {
             }
         }
 
-        match rvc.load_f0(pitch_algorithm) {
+        match rvc.load_f0(pitch_algorithm.clone_lossy()) {
             Ok(_) => (),
             Err(e) => {
                 println!("Error loading f0: {:?}", e);
@@ -494,7 +509,7 @@ impl UpdateSource for RvcInferenceFilter {
 
         if let Some(new_pitch_algorithm) = settings.get(SETTING_PITCH_ALGORITHM) {
             if state.pitch_algorithm != new_pitch_algorithm {
-                state.pitch_algorithm = new_pitch_algorithm;
+                state.pitch_algorithm = new_pitch_algorithm.clone_lossy();
                 match state.engine.load_f0(new_pitch_algorithm) {
                     Ok(_) => (),
                     Err(e) => {
@@ -639,6 +654,21 @@ impl FilterAudioSource for RvcInferenceFilter {
     }
 }
 
+impl ActivateSource for RvcInferenceFilter {
+    fn activate(&mut self) {
+        self.start_thread();
+    }
+}
+
+impl DeactivateSource for RvcInferenceFilter {
+    fn deactivate(&mut self) {
+        if let Some(handle) = self.thread_handle.take() {
+            self.shared_state.running.store(false, std::sync::atomic::Ordering::Relaxed);
+            handle.join().unwrap();
+        }
+    }
+}
+
 fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> ndarray::Array1<f32> {
     // move and append the last n samples
     {
@@ -675,7 +705,11 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
             .unwrap();
 
     // inference
-    let output = match state.engine.infer(input_buffer_16k_view, state.sample_frame_16k_size, Some(state.pitch_shift)) {
+    let output = match state.engine.infer(
+        input_buffer_16k_view,
+        state.sample_frame_16k_size,
+        Some(state.pitch_shift),
+    ) {
         Ok(output) => output,
         Err(e) => {
             println!("Error: {:?}", e);
@@ -748,6 +782,7 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
 }
 
 fn thread_loop(shared_state: Arc<RvcInferenceSharedState>) {
+    set_thread_panic_hook();
     let mut input_sample: Vec<f32> = {
         let state = shared_state.state.lock();
         Vec::with_capacity(state.sample_frame_size)
@@ -831,6 +866,8 @@ impl Module for RvcInferenceModule {
             .enable_update()
             .enable_get_properties()
             .enable_filter_audio()
+            .enable_activate()
+            .enable_deactivate()
             .build();
 
         load_context.register_source(source);

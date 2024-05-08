@@ -12,6 +12,10 @@ ndarray = "0.15.6"
 ndarray-conv = "0.3.3"
 parking_lot = "0.12.2"
 rubato = "0.15.0"
+mel_spec = "0.2.2"
+num-complex = "0.4.5"
+ndarray-stats = "0.5.1"
+ndarray-rand = "0.14.0"
 
 [lib]
 name = "obsrvc"
