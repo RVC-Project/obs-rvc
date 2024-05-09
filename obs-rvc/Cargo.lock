@@ -749,10 +749,14 @@ dependencies = [
  "ndarray-conv",
  "ndarray-rand",
  "ndarray-stats",
+ "num-complex",
  "obs-wrapper",
+ "ort",
  "parking_lot",
  "rubato",
  "rustfft",
+ "tracing-subscriber",
+ "winapi",
 ]
 
 [[package]]
@@ -1238,30 +1242,6 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "untrusted",
-]
-
-[[package]]
-name = "rvc"
-version = "0.1.0"
-dependencies = [
- "mel_spec",
- "ndarray",
- "ndarray-conv",
- "ndarray-rand",
- "ndarray-stats",
- "num-complex",
- "obs-wrapper",
- "ort",
- "rubato",
- "rustfft",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "rvc-rpc"
-version = "0.1.0"
-dependencies = [
- "rvc",
 ]
 
 [[package]]
