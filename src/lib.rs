@@ -1,4 +1,5 @@
 mod obs_props_ext;
+mod ndarray_ext;
 mod rt_utils;
 mod rvc;
 
@@ -662,10 +663,7 @@ impl ActivateSource for RvcInferenceFilter {
 
 impl DeactivateSource for RvcInferenceFilter {
     fn deactivate(&mut self) {
-        if let Some(handle) = self.thread_handle.take() {
-            self.shared_state.running.store(false, std::sync::atomic::Ordering::Relaxed);
-            handle.join().unwrap();
-        }
+        self.stop_thread();
     }
 }
 
@@ -704,18 +702,28 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
         ndarray::ArrayView1::from_shape((state.input_buffer_16k.len(),), &state.input_buffer_16k)
             .unwrap();
 
+    println!("input: {:?}", input_buffer_16k_view);
+
     // inference
     let output = match state.engine.infer(
         input_buffer_16k_view,
         state.sample_frame_16k_size,
         Some(state.pitch_shift),
     ) {
-        Ok(output) => output,
+        Ok(output) => {
+            let skip_head = state.extra_frame_size / (state.sample_rate / 100);
+            let flow_head = if skip_head > 24 { skip_head - 24 } else { 0 };
+            let dec_head = skip_head - flow_head;
+            let end = state.model_return_size + dec_head;
+            output.slice(s![dec_head..end]).to_owned()
+        },
         Err(e) => {
             println!("Error: {:?}", e);
             return ndarray::Array1::zeros(state.sample_frame_size);
         }
     };
+
+    println!("output: {:?}", output);
 
     if output.len() != state.model_return_size {
         println!(
@@ -782,7 +790,6 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
 }
 
 fn thread_loop(shared_state: Arc<RvcInferenceSharedState>) {
-    set_thread_panic_hook();
     let mut input_sample: Vec<f32> = {
         let state = shared_state.state.lock();
         Vec::with_capacity(state.sample_frame_size)
@@ -824,28 +831,58 @@ fn thread_loop(shared_state: Arc<RvcInferenceSharedState>) {
 impl RvcInferenceFilter {
     fn start_thread(&mut self) {
         if self.thread_handle.is_none() {
+            self.shared_state.running.store(true, std::sync::atomic::Ordering::Relaxed);
             let shared_state = self.shared_state.clone();
             let handle = std::thread::spawn(move || thread_loop(shared_state));
             self.thread_handle.replace(handle);
+        }
+    }
+
+    fn stop_thread(&mut self) {
+        if let Some(handle) = self.thread_handle.take() {
+            self.shared_state
+                .running
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            match handle.join() {
+                Ok(_) => (),
+                Err(e) => {
+                    println!("Error joining thread: {:?}", e);
+                }
+            }
         }
     }
 }
 
 impl Drop for RvcInferenceFilter {
     fn drop(&mut self) {
-        self.shared_state
-            .running
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        if let Some(handle) = self.thread_handle.take() {
-            handle.join().unwrap();
-        }
+        self.stop_thread();
     }
 }
 
 impl Module for RvcInferenceModule {
     fn new(context: ModuleRef) -> Self {
+        set_thread_panic_hook();
+
+        tracing_subscriber::fmt::init();
+
         let binary_path = PathBuf::from(context.binary_path().unwrap().as_str());
         let data_path = PathBuf::from(context.data_path().unwrap().as_str());
+
+        let dll_path = binary_path.parent().unwrap();
+        {
+            let dll_path_str = dll_path.to_string_lossy().replace("/", "\\");
+            let path = std::env::var("PATH").unwrap_or_default();
+            let new_path = format!("{};{}", dll_path_str, path);
+            std::env::set_var("PATH", new_path);
+        }
+
+        let ort_path = dll_path.join("onnxruntime.dll");
+        match ort::init_from(ort_path.to_string_lossy()).commit() {
+            Ok(_) => (),
+            Err(e) => {
+                println!("Error loading onnxruntime: {:?}", e);
+            }
+        }
 
         unsafe {
             BINARY_PATH = Some(binary_path);

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use ndarray::{s, Axis};
 use ndarray_rand::{rand_distr::Normal, RandomExt};
 use ort::Session;
+use crate::ndarray_ext::CopyWithin;
 
 use super::{
     enums::{PitchAlgorithm, RvcModelVersion},
@@ -18,6 +19,9 @@ pub struct RvcInfer {
     f0_algorithm: Option<PitchAlgorithm>,
     f0_mel_min: f32,
     f0_mel_max: f32,
+
+    cache_pitch: ndarray::Array1<i64>,
+    cache_pitchf: ndarray::Array1<f32>,
 }
 
 impl RvcInfer {
@@ -33,6 +37,8 @@ impl RvcInfer {
             f0_algorithm: None,
             f0_mel_min,
             f0_mel_max,
+            cache_pitch: ndarray::Array1::zeros(1024),
+            cache_pitchf: ndarray::Array1::zeros(1024),
         }
     }
 
@@ -122,36 +128,75 @@ impl RvcInfer {
             return Err(RvcInferError::ModelNotLoaded);
         }
 
-        let hubert_output = self.hubert(input)?;
-        let hubert_length = hubert_output.len_of(Axis(1));
-        let hubert_length_arr = ndarray::Array1::from_vec(vec![hubert_length as i64]);
+        // let hubert_output = self.hubert(input)?;
+        let hubert_output = {
+            let raw_hubert = self.hubert(input)?;
+            let extended_hubert_shape = {
+                let raw_h = raw_hubert.shape();
+                [raw_h[0], raw_h[1], raw_h[2] * 2 + 1]
+            };
+            let max_k = raw_hubert.len_of(Axis(2)) - 1;
+            ndarray::Array3::from_shape_fn(extended_hubert_shape, 
+                |(i, j, k)| raw_hubert[[i, j, usize::min(k / 2, max_k)]]
+            ).permuted_axes([0, 2, 1])
+        };
+
+        let hubert_length = input.len() / 160;
+        let hubert_output = hubert_output.slice(s![.., ..hubert_length, ..]);
+        // let hubert_length = hubert_output.len_of(Axis(1));
+        let hubert_length_arr = ndarray::Array1::from_elem(1, hubert_length as i64);
 
         // TODO: index search
+        
 
         // if f0
         let pitch_shift = pitch_shift.unwrap_or(0);
-        let (pitch, pitchf) = self.pitch(input, pitch_shift, sample_frame_16k_size)?;
+        let (pitch, pitchf) = {
+            let (pitch, pitchf) = self.pitch(input, pitch_shift, sample_frame_16k_size)?;
+
+            let pitch_len = pitch.len();
+            let shift = sample_frame_16k_size / 160;
+            
+            self.cache_pitch.copy_within(shift.., 0);
+            self.cache_pitchf.copy_within(shift.., 0);
+
+            let cache_pitch_start = self.cache_pitch.len() + 4 - pitch_len;
+
+            self.cache_pitch.slice_mut(s![cache_pitch_start..]).assign(&pitch.slice(s![3..pitch_len - 1]));
+            self.cache_pitchf.slice_mut(s![cache_pitch_start..]).assign(&pitchf.slice(s![3..pitch_len - 1]));
+
+            let cached_range_start = self.cache_pitch.len() - hubert_length;
+            (
+                self.cache_pitch.slice(s![cached_range_start..]).to_owned().insert_axis(Axis(0)), 
+                self.cache_pitchf.slice(s![cached_range_start..]).to_owned().insert_axis(Axis(0))
+            )
+        };
 
         let ds = 0;
-        let ds = ndarray::Array1::from_vec(vec![ds as i64]);
+        let ds = ndarray::Array1::from_elem(1, ds as i64);
         let rnd = ndarray::Array3::random((1, 192, hubert_length), Normal::from_mean_cv(0.0f32, 1.0f32).unwrap());
 
-        let session = self.session.as_ref().unwrap();
-
-        let output = session.run(ort::inputs![
-            "phone" => hubert_output, 
-            "phone_lengths" => hubert_length_arr, 
-            "pitch" => pitch,
-            "pitchf" => pitchf,
-            "ds" => ds,
-            "rnd" => rnd
-        ]?)?;
+        let output = {
+            let session = self.session.as_ref().unwrap();
+            session.run(ort::inputs![
+                "phone" => hubert_output, 
+                "phone_lengths" => hubert_length_arr, 
+                "pitch" => pitch,
+                "pitchf" => pitchf,
+                "ds" => ds,
+                "rnd" => rnd
+            ]?)?
+        };
 
         let output_tensor = output["audio"]
             .try_extract_tensor::<f32>()?
-            .into_dimensionality::<ndarray::Ix1>()?;
+            .into_dimensionality::<ndarray::Ix3>()?;
 
-        let out = output_tensor.mapv(|x| x * 32767.0f32);
+        let out = output_tensor
+            .remove_axis(Axis(0))
+            .remove_axis(Axis(0))
+            .to_owned();
+            // .mapv(|x| x * 32767.0f32);
 
         Ok(out)
     }

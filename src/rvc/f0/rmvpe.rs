@@ -1,6 +1,6 @@
 use std::{collections::HashMap, mem::MaybeUninit};
 
-use mel_spec::{mel, stft};
+use mel_spec::{mel};
 use ndarray::{azip, s, Axis, CowArray, Zip};
 use ndarray_stats::QuantileExt;
 use num_complex::{Complex, Complex32, Complex64};
@@ -25,59 +25,46 @@ struct MelSpectrogram {
 }
 
 fn get_hann_window(window_length: usize) -> ndarray::Array1<f32> {
-    ndarray::Array1::linspace(0.0, window_length as f32 - 1.0, window_length).mapv(|n| {
-        0.5 * (1.0 - (2.0 * std::f32::consts::PI * n / (window_length as f32 - 1.0)).cos())
+    ndarray::Array1::from_shape_fn(window_length, |i| {
+        0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / (window_length as f64 - 1.0)).cos() as f32)
     })
 }
 
-// fn stft(
-//     input: ndarray::ArrayView1<f32>,
-//     fft_size: usize,
-//     hop_length: usize,
-//     window: ndarray::ArrayView1<f32>,
-//     center: bool,
-// ) -> ndarray::Array2<Complex32> {
-//     let mut planner = FftPlanner::new();
-//     let fft = planner.plan_fft_forward(fft_size);
+fn get_hann_window_periodic(window_length: usize) -> ndarray::Array1<f32> {
+    ndarray::Array1::from_shape_fn(window_length, |i| {
+        0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / ((window_length + 1) as f64 - 1.0)).cos() as f32)
+    })
+}
 
-//     let mut output = ndarray::Array2::uninit(
-//         ((input.len() - fft_size) / hop_length + 1, fft_size)
-//     );
-
-//     let window_sum = window.sum();
-
-//     for (i, mut row) in output.outer_iter_mut().enumerate() {
-//         let start = if center {
-//             i * hop_length - fft_size / 2
-//         } else {
-//             i * hop_length
-//         };
-
-//         let mut frame = ndarray::Array1::uninit(fft_size);
-//         Zip::from(frame.slice_mut(s![..input.len() - start]))
-//             .and(input.slice(s![start..]))
-//             .and_broadcast(window)
-//             .for_each(|frame, &input, &window| {
-//                 *frame = MaybeUninit::new(Complex32::new(input * window / window_sum, 0.0f32));
-//             });
-//         let mut frame = unsafe { frame.assume_init() };
-//         fft.process(frame.as_slice_mut().unwrap());
-//         row.assign(&frame.mapv(MaybeUninit::new));
-//     }
-
-//     unsafe {output.assume_init()}
-// }
-
-
-fn pad_reflect(mut input_data: ndarray::Array1<f32>, pad_amount: usize) -> ndarray::Array1<f32> {
+fn pad_constant<N>(input_data: ndarray::Array1<N>, pad_amount: usize, constant_value: N) -> ndarray::Array1<N>
+where N: Copy {
     let shape: ndarray::prelude::Dim<[usize; 1]> = input_data.raw_dim();
-    let mut padded = ndarray::Array1::zeros(shape[0] + 2 * pad_amount);
+    let mut padded = ndarray::Array1::from_elem(shape[0] + 2 * pad_amount, constant_value);
     padded.slice_mut(s![pad_amount..shape[0]+pad_amount]).assign(&input_data);
-    for i in 0..pad_amount {
-        padded[i] = input_data[pad_amount-i-1];
-        padded[shape[0]+pad_amount+i] = input_data[shape[0]-i-1];
-    }
     padded
+}
+
+fn pad_reflect<N>(arr: ndarray::ArrayView1<N>, pad: usize) -> ndarray::Array1<N>
+where N: Copy
+{
+    let len = arr.len();
+    let mut padded = ndarray::Array1::<N>::uninit(len + 2 * pad);
+    let arr_uninit = arr.mapv(MaybeUninit::new);
+
+    // Copy the original array to the center of the padded array
+    padded.slice_mut(s![pad..len + pad]).assign(&arr_uninit);
+
+    // Pad left
+    for i in 0..pad {
+        padded.slice_mut(s![pad - i - 1]).assign(&arr_uninit.slice(s![i+1]));
+    }
+
+    // Pad right
+    for i in 0..pad {
+        padded.slice_mut(s![len + pad + i]).assign(&arr_uninit.slice(s![len - i - 2]));
+    }
+
+    unsafe { padded.assume_init() }
 }
 
 fn unfold_permute_forward_transform(input_data: ndarray::ArrayView1<f32>, filter_length: usize, hop_length: usize) -> ndarray::Array2<f32> {
@@ -90,59 +77,42 @@ fn unfold_permute_forward_transform(input_data: ndarray::ArrayView1<f32>, filter
     unfolded
 }
 
-// fn stft(input_data: ndarray::Array1<f32>, fft_size: usize, hop_length: usize) -> (ndarray::Array2<f32>, Array2<f32>) {
-//     let shape = input_data.raw_dim();
-//     let unfolded_dim = (shape[1] - filter_length) / hop_length + 1;
-//     let mut forward_transform = ndarray::Array3::zeros((shape[0], unfolded_dim, filter_length));
-//     for i in 0..unfolded_dim {
-//         forward_transform.slice_mut(s![.., i, ..]).assign(&input_data.slice(s![.., i*hop_length..i*hop_length+filter_length]));
-//     }
-//     let mut planner = FftPlanner::new();
-//     let fft = planner.plan_fft_forward(filter_length);
-//     for i in 0..shape[0] {
-//         for j in 0..unfolded_dim {
-//             let mut buffer: Vec<Complex<f32>> = forward_transform.slice(s![i, j, ..]).to_vec().into_iter().map(|x| Complex::new(x, 0.0)).collect();
-//             fft.process(&mut buffer);
-//             forward_transform.slice_mut(s![i, j, ..]).assign(&Array1::from(buffer).mapv(|x| x.norm()));
-//         }
-//     }
-//     let cutoff = (filter_length / 2) + 1;
-//     let real_part = forward_transform.slice(s![.., ..cutoff, ..]).to_owned();
-//     let imag_part = forward_transform.slice(s![.., cutoff.., ..]).to_owned();
-//     (real_part, imag_part)
-// }
-
-
-fn stft(signal: ndarray::ArrayView1<f32>, fft_size: usize, hop_length: usize, window: ndarray::ArrayView1<f32>) -> ndarray::Array2<Complex<f32>> {
+fn stft(signal: ndarray::ArrayView1<f32>, fft_size: usize, hop_length: usize, window: ndarray::ArrayView1<f32>, center: bool) -> ndarray::Array2<f32> {
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(fft_size);
 
     let L = signal.len();
-    let N = fft_size / 2 + 1;
+    let N = fft_size / 2 + 1; // onesided = true
     let T = if true { 1 + L / hop_length } else { 1 + (L - fft_size) / hop_length };
-    let pad_len = fft_size / 2;
 
-    let signal = pad_reflect(signal.to_owned(), pad_len);
-    let forward_transform = unfold_permute_forward_transform(signal.view(), fft_size, hop_length);
+    let win_length = window.len();
 
-    let mut output = ndarray::Array2::uninit((N, T));
+    let signal = match center {
+        true => pad_reflect(signal, fft_size / 2).to_shared(),
+        false => signal.to_shared(),
+    };
 
-    let window_sum = window.sum();
-    for (t, mut col) in output.outer_iter_mut().enumerate() {
-        let mut frame = ndarray::Array1::from_elem(fft_size, Complex32::zero());
-        let start = if true { t * hop_length - fft_size / 2 } else { t * hop_length };
-        Zip::from(frame.slice_mut(s![..L - start]))
-            .and(signal.slice(s![start..]))
-            .and_broadcast(window)
-            .for_each(|frame, &signal, &window| {
-                *frame = Complex32::new(signal * window / window_sum, 0.0f32);
-            });
-        let mut frame = CowArray::from(frame);
-        fft.process(frame.as_slice_mut().unwrap());
-        col.assign(&frame.mapv(MaybeUninit::new));
+    let window = if win_length < fft_size {
+        // this should not happen yet... might have problem
+        let left = (fft_size - win_length) / 2;
+        window.slice(s![left..left + win_length]).to_shared()
+    } else {
+        window.to_shared()
+    };
+    
+    let input = ndarray::Array2::from_shape_fn(
+        (T, fft_size), 
+        |(i, j)| signal[i * hop_length + j]
+    ) * window;
+
+    let mut input = input.mapv(|x| Complex::new(x, 0.0));
+
+    for mut row in input.rows_mut() {
+        fft.process(row.as_slice_mut().unwrap());
     }
 
-    unsafe { output.assume_init() }
+    input.swap_axes(0, 1);
+    input.slice(s![..N, ..]).mapv(|x| x.norm_sqr().sqrt())
 }
 
 fn to_local_average_cents(salience: ndarray::ArrayView2<f32>, cents_mapping: ndarray::ArrayView1<f32>, threshold: f32) -> ndarray::Array1<f32> {
@@ -199,19 +169,18 @@ impl MelSpectrogram {
         let win_length_new = (self.win_length as f64 * factor).round() as usize;
         let hop_length_new = self.hop_length * speed;
         if !self.hann_window_cache.contains_key(&keyshift) {
-            self.hann_window_cache.insert(keyshift, get_hann_window(win_length_new));
+            self.hann_window_cache.insert(keyshift, get_hann_window_periodic(win_length_new));
         }
 
         let hann_window = self.hann_window_cache[&keyshift].view();
+
         let mut magnitude = stft(
             input,
             fft_size_new,
             hop_length_new,
             hann_window,
             center,
-        ).mapv(|x| x.norm_sqr());
-
-        println!("{:?}", magnitude);
+        );
 
         if keyshift != 0 {
             let size = self.fft_size / 2 + 1;
@@ -227,7 +196,7 @@ impl MelSpectrogram {
                 .scaled_add(self.win_length as f32 / win_length_new as f32, &rhs);
         }
 
-        let mel_output = self.mel_basis.dot(&magnitude.t());
+        let mel_output = self.mel_basis.dot(&magnitude);
         mel_output.mapv(|x| x.max(self.clamp).ln())
     }
 
@@ -258,7 +227,7 @@ impl Rmvpe {
             padded.slice_mut(s![.., ..n_frames]).assign(&mel);
             mel = padded.into();
         }
-
+        let mel = mel.insert_axis(Axis(0));
         let output = self.session.run(ort::inputs!["input" => mel]?)?;
         let output_hidden = output["output"]
             .try_extract_tensor::<f32>()?
@@ -295,17 +264,62 @@ mod tests {
 
     #[test]
     fn test_stft() {
-        // Test case 1
         let signal1 = ndarray::Array1::linspace(0.0f32, 1.0f32, 500);
         let fft_size1 = 16;
         let hop_length1 = 160;
-        let window1 = get_hann_window(16);
+        let window1 = get_hann_window_periodic(16);
         let center1 = true;
+
+        // TODO: this expected output is from torch. It has a considerable difference from the output of this stft function
         let expected_output1 = ndarray::arr2(&[
-            [Complex::new(1.5, 0.0), Complex::new(0.0, 0.0)],
-            [Complex::new(3.5, 0.0), Complex::new(0.0, 0.0)],
+            [3.7801e-02, 2.5651e+00, 5.1303e+00, 7.6954e+00],
+            [5.7373e-03, 1.2829e+00, 2.5653e+00, 3.8478e+00],
+            [1.4787e-02, 6.7956e-03, 6.7958e-03, 6.7957e-03],
+            [3.2463e-03, 1.6874e-03, 1.6874e-03, 1.6875e-03],
+            [2.3478e-03, 6.6042e-04, 6.6042e-04, 6.6054e-04],
+            [1.4494e-03, 3.1195e-04, 3.1202e-04, 3.1184e-04],
+            [1.2455e-03, 1.5500e-04, 1.5485e-04, 1.5491e-04],
+            [1.0416e-03, 6.5722e-05, 6.5798e-05, 6.5790e-05],
+            [1.0417e-03, 0.0000e+00, 0.0000e+00, 2.3842e-07]
         ]);
         let output1 = stft(signal1.view(), fft_size1, hop_length1, window1.view(), center1);
+        // assert_eq!(output1.shape(), expected_output1.shape());
         assert_eq!(output1, expected_output1);
     }
+
+    #[test]
+    fn test_pad_reflect() {
+        // Test case 1
+        let input_data1 = ndarray::arr1(&[1.0, 2.0, 3.0]);
+        let pad_amount1 = 2;
+        let expected_output1 = ndarray::arr1(&[3.0, 2.0, 1.0, 2.0, 3.0, 2.0, 1.0]);
+        let output1 = pad_reflect(input_data1.view(), pad_amount1);
+        assert_eq!(output1, expected_output1);
+
+        // Test case 2
+        let input_data2 = ndarray::arr1(&[4.0, 5.0]);
+        let pad_amount2 = 1;
+        let expected_output2 = ndarray::arr1(&[5.0, 4.0, 5.0, 4.0]);
+        let output2 = pad_reflect(input_data2.view(), pad_amount2);
+        assert_eq!(output2, expected_output2);
+    }
+
+    #[test]
+    fn test_pad_constant() {
+        // Test case 1
+        let input_data1 = ndarray::arr1(&[1.0, 2.0, 3.0]);
+        let pad_amount1 = 2;
+        let constant_value1 = 0.0;
+        let expected_output1 = ndarray::arr1(&[0.0, 0.0, 1.0, 2.0, 3.0, 0.0, 0.0]);
+        let output1 = pad_constant(input_data1, pad_amount1, constant_value1);
+        assert_eq!(output1, expected_output1);
+        // Test case 2
+        let input_data2 = ndarray::arr1(&[4.0, 5.0]);
+        let pad_amount2 = 1;
+        let constant_value2 = 2.0;
+        let expected_output2 = ndarray::arr1(&[2.0, 4.0, 5.0, 2.0]);
+        let output2 = pad_constant(input_data2, pad_amount2, constant_value2);
+        assert_eq!(output2, expected_output2);
+    }
 }
+

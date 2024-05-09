@@ -115,8 +115,8 @@ fn linear_interpolate_align_corners(input: ArrayView1<f32>, size: usize) -> Arra
 
     Zip::indexed(output.view_mut()).for_each(|idx, val| {
         let idx = idx as f32 * step;
-        let idx_floor = idx.floor() as usize;
-        let idx_ceil = idx.ceil() as usize;
+        let idx_floor = usize::clamp(idx.floor() as usize, 0, input.len() - 1);
+        let idx_ceil = usize::clamp(idx.ceil() as usize, 0, input.len() - 1);
         let idx_frac = idx - idx_floor as f32;
         *val = input[idx_floor] * (1.0 - idx_frac) + input[idx_ceil] * idx_frac;
     });

@@ -19,7 +19,7 @@ fn get_onnx_session(cache_path: PathBuf) -> Result<ort::SessionBuilder, ort::Err
                 .with_cuda_graph()
                 .with_arena_extend_strategy(ort::ArenaExtendStrategy::SameAsRequested)
                 .build(),
-            CPUExecutionProvider::default().build(),
+            // CPUExecutionProvider::default().build(),
         ])
 }
 
