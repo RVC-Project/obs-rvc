@@ -1,6 +1,6 @@
 use obs_wrapper::{data::FromDataItem, obs_sys::{obs_property_list_add_int, obs_property_list_insert_int, obs_property_t, size_t}, properties::{ComboFormat, ListType}, string::ObsString};
 
-use crate::rvc::enums::{PitchAlgorithm, RvcModelVersion};
+use crate::enums::{PitchAlgorithm, RvcModelVersion};
 
 macro_rules! enum_to_int_list_type {
     ($t:ty) => {
@@ -44,59 +44,7 @@ macro_rules! enum_to_int_list_type {
     };
 }
 
-impl From<RvcModelVersion> for i64 {
-    fn from(version: RvcModelVersion) -> Self {
-        match version {
-            RvcModelVersion::V1 => 1,
-            RvcModelVersion::V2 => 2,
-        }
-    }
-}
 
-impl From<i64> for RvcModelVersion {
-    fn from(val: i64) -> Self {
-        match val {
-            1 => RvcModelVersion::V1,
-            2 => RvcModelVersion::V2,
-            _ => RvcModelVersion::V2,
-        }
-    }
-}
-
-impl RvcModelVersion {
-    fn is_valid(val: i64) -> bool {
-        match val {
-            1 | 2 => true,
-            _ => false,
-        }
-    }
-}
-
-impl From<PitchAlgorithm> for i64 {
-    fn from(algorithm: PitchAlgorithm) -> Self {
-        match algorithm {
-            PitchAlgorithm::Rmvpe(_) => 1,
-        }
-    }
-}
-
-impl From<i64> for PitchAlgorithm {
-    fn from(val: i64) -> Self {
-        match val {
-            1 => PitchAlgorithm::Rmvpe(None),
-            _ => PitchAlgorithm::Rmvpe(None),
-        }
-    }
-}
-
-impl PitchAlgorithm {
-    fn is_valid(val: i64) -> bool {
-        match val {
-            1 => true,
-            _ => false,
-        }
-    }
-}
 
 enum_to_int_list_type!(RvcModelVersion);
 enum_to_int_list_type!(PitchAlgorithm);

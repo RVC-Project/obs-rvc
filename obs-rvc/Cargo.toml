@@ -6,6 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
 obs-wrapper = { version = "0.4.1", path = "../vendor/obs-wrapper" }
+rvc-common = {path = "../rvc-common", features = ["obs_props"]}
 rustfft = "6.2.0"
 ndarray = { version = "0.15.6" }
 ndarray-conv = "0.3.3"
@@ -14,7 +15,6 @@ rubato = "0.15.0"
 mel_spec = "0.2.2"
 ndarray-stats = "0.5.1"
 ndarray-rand = "0.14.0"
-
 
 [lib]
 name = "obsrvc"

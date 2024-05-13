@@ -753,6 +753,7 @@ dependencies = [
  "parking_lot",
  "rubato",
  "rustfft",
+ "rvc-common",
 ]
 
 [[package]]
@@ -1250,18 +1251,30 @@ dependencies = [
  "ndarray-rand",
  "ndarray-stats",
  "num-complex",
- "obs-wrapper",
  "ort",
  "rubato",
  "rustfft",
- "tracing-subscriber",
+ "rvc-common",
+]
+
+[[package]]
+name = "rvc-common"
+version = "0.1.0"
+dependencies = [
+ "ndarray",
+ "obs-wrapper",
+ "ort",
 ]
 
 [[package]]
 name = "rvc-rpc"
 version = "0.1.0"
 dependencies = [
+ "ndarray",
+ "ort",
  "rvc",
+ "rvc-common",
+ "tracing-subscriber",
 ]
 
 [[package]]

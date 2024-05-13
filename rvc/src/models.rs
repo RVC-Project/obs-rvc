@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use ort::*;
 
-use super::enums::PitchAlgorithm;
+use rvc_common::enums::PitchAlgorithm;
 
 fn get_onnx_session(cache_path: PathBuf) -> Result<ort::SessionBuilder, ort::Error> {
     Session::builder()?
@@ -13,13 +13,14 @@ fn get_onnx_session(cache_path: PathBuf) -> Result<ort::SessionBuilder, ort::Err
                 .with_timing_cache(true)
                 .with_engine_cache(true)
                 .with_fp16(true)
+                .with_builder_optimization_level(5)
                 .with_engine_cache_path(cache_path.to_string_lossy())
+                .with_build_heuristics(true)
+                .with_detailed_build_log(true)
                 .build(),
             CUDAExecutionProvider::default()
-                .with_cuda_graph()
-                .with_arena_extend_strategy(ort::ArenaExtendStrategy::SameAsRequested)
                 .build(),
-            // CPUExecutionProvider::default().build(),
+            CPUExecutionProvider::default().build(),
         ])
 }
 
@@ -47,7 +48,7 @@ pub fn load_f0_from_file(
     pitch_algoritm: PitchAlgorithm,
 ) -> Result<Session, ort::Error> {
     let filename = match pitch_algoritm {
-        PitchAlgorithm::Rmvpe(_) => "rmvpe.onnx",
+        PitchAlgorithm::Rmvpe => "rmvpe.onnx",
     };
 
     get_onnx_session(cache_path)?.commit_from_file(path.join(filename))

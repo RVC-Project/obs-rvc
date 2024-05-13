@@ -6,4 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+rvc-common = { path = "../rvc-common" }
 rvc = { path = "../rvc" }
+tracing-subscriber = { version = "0.3", features = [ "env-filter", "fmt" ] }
+ort = { version = "2.0.0-rc.2", features = ["download-binaries", "copy-dylibs", "half", "load-dynamic", "cuda", "tensorrt", "openvino", "directml"] }
+ndarray = { version = "0.15.6" }

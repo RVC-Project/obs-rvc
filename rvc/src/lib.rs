@@ -1,6 +1,5 @@
 mod rvc;
 mod models;
 mod f0;
-pub mod errors;
-pub mod enums;
+mod ndarray_ext;
 pub use rvc::*;

@@ -1,16 +1,13 @@
-mod obs_props_ext;
 mod ndarray_ext;
 mod rt_utils;
-mod rvc;
+mod rvcadapter;
 
 use ndarray::{s, ArrayView1};
 use parking_lot::{Condvar, FairMutex, Mutex};
 use rt_utils::{envelop_mixing, get_sola_offset, upmix_audio_data_context};
 use rubato::{FftFixedInOut, Resampler};
-use rvc::{
-    enums::{PitchAlgorithm, RvcModelVersion},
-    RvcInfer,
-};
+use rvc_common::enums::{PitchAlgorithm, RvcModelVersion};
+use rvcadapter::RvcInfer;
 
 use obs_wrapper::{
     media::audio,
@@ -129,13 +126,11 @@ struct RvcInferenceState {
     upsampler: FftFixedInOut<f32>,
     downsampler: FftFixedInOut<f32>,
 
-    engine: RvcInfer,
+    engine: Option<RvcInfer>,
 }
 
 fn set_thread_panic_hook() {
-    use std::{
-        panic::{set_hook, take_hook},
-    };
+    use std::panic::{set_hook, take_hook};
     let orig_hook = take_hook();
     set_hook(Box::new(move |panic_info| {
         println!("Panic: {:?}", panic_info);
@@ -179,9 +174,6 @@ impl Sourceable for RvcInferenceFilter {
         let model_path = get_path_from_settings!(settings, SETTING_MODEL_PATH);
         let index_path = get_path_from_settings!(settings, SETTING_INDEX_PATH);
 
-        let infer_data_path = unsafe { DATA_PATH.as_ref().unwrap() }.join("rvcinfer");
-        let mut rvc = RvcInfer::new(infer_data_path);
-
         settings.set_default::<i32>(SETTING_DEST_SAMPLE_RATE, 40000);
         settings.set_default::<i32>(SETTING_PITCH_SHIFT, 12);
         settings.set_default::<f32>(SETTING_RESONANCE_SHIFT, 0.07);
@@ -192,7 +184,7 @@ impl Sourceable for RvcInferenceFilter {
         settings.set_default::<f32>(SETTING_EXTRA_INFERENCE_TIME, 2.00);
         settings.set_default::<RvcModelVersion>(SETTING_MODEL_VERSION, RvcModelVersion::V2);
         settings
-            .set_default::<PitchAlgorithm>(SETTING_PITCH_ALGORITHM, PitchAlgorithm::Rmvpe(None));
+            .set_default::<PitchAlgorithm>(SETTING_PITCH_ALGORITHM, PitchAlgorithm::Rmvpe);
 
         let model_output_sample_rate = settings.get(SETTING_DEST_SAMPLE_RATE).unwrap_or(40000);
         let sample_length = settings.get(SETTING_SAMPLE_LENGTH).unwrap_or(0.30);
@@ -203,7 +195,7 @@ impl Sourceable for RvcInferenceFilter {
             .unwrap_or(RvcModelVersion::V2);
         let pitch_algorithm = settings
             .get(SETTING_PITCH_ALGORITHM)
-            .unwrap_or(PitchAlgorithm::Rmvpe(None));
+            .unwrap_or(PitchAlgorithm::Rmvpe);
 
         let zc = sample_rate / 100;
 
@@ -245,28 +237,13 @@ impl Sourceable for RvcInferenceFilter {
         // 48k => 16k sample frame size
         let downsampler = FftFixedInOut::new(sample_rate, 16000, sample_frame_size, 1).unwrap();
 
-        match rvc.load_contentvec(model_version) {
-            Ok(_) => (),
-            Err(e) => {
-                println!("Error loading contentvec: {:?}", e);
-            }
-        }
+        let binary_path = unsafe { BINARY_PATH.as_ref().unwrap().parent().unwrap().join("rvc.exe") };
+        let infer_data_path = unsafe { DATA_PATH.as_ref().unwrap() }.join("rvcinfer");
 
-        match rvc.load_f0(pitch_algorithm.clone_lossy()) {
-            Ok(_) => (),
-            Err(e) => {
-                println!("Error loading f0: {:?}", e);
-            }
-        }
-
-        if let Some(model_path) = model_path.clone() {
-            match rvc.load_model(model_path) {
-                Ok(_) => (),
-                Err(e) => {
-                    println!("Error loading model: {:?}", e);
-                }
-            }
-        }
+        let rvc = match model_path.clone() {
+            Some(path) => Some(RvcInfer::new(binary_path, model_version, pitch_algorithm, path, infer_data_path)),
+            None => None,
+        };
 
         let state = RvcInferenceState {
             sample_rate,
@@ -369,7 +346,7 @@ impl GetPropertiesSource for RvcInferenceFilter {
         let mut pitch_algorithm_list =
             p.add_list::<PitchAlgorithm>(SETTING_PITCH_ALGORITHM, obs_string!("音高算法"), false);
 
-        pitch_algorithm_list.push(obs_string!("RMVPE"), PitchAlgorithm::Rmvpe(None));
+        pitch_algorithm_list.push(obs_string!("RMVPE"), PitchAlgorithm::Rmvpe);
 
         p.add(
             SETTING_PITCH_SHIFT,
@@ -440,9 +417,10 @@ impl UpdateSource for RvcInferenceFilter {
         state.sample_rate = sample_rate;
 
         let model_changed = get_path_from_settings!(state.model_path, settings, SETTING_MODEL_PATH);
-        get_path_from_settings!(state.index_path, settings, SETTING_INDEX_PATH);
+        let index_changed = get_path_from_settings!(state.index_path, settings, SETTING_INDEX_PATH);
 
         let mut recalculate_input_buffer = false;
+        let mut reload_rvc = model_changed || index_changed;
 
         if let Some(new_pitch_shift) = settings.get(SETTING_PITCH_SHIFT) {
             if state.pitch_shift != new_pitch_shift {
@@ -499,39 +477,14 @@ impl UpdateSource for RvcInferenceFilter {
         if let Some(new_model_version) = settings.get(SETTING_MODEL_VERSION) {
             if state.model_version != new_model_version {
                 state.model_version = new_model_version;
-                match state.engine.load_contentvec(new_model_version) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        println!("Error loading contentvec: {:?}", e);
-                    }
-                }
+                reload_rvc = true;
             }
         }
 
         if let Some(new_pitch_algorithm) = settings.get(SETTING_PITCH_ALGORITHM) {
             if state.pitch_algorithm != new_pitch_algorithm {
-                state.pitch_algorithm = new_pitch_algorithm.clone_lossy();
-                match state.engine.load_f0(new_pitch_algorithm) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        println!("Error loading f0: {:?}", e);
-                    }
-                }
-            }
-        }
-
-        if model_changed {
-            let model_path = state.model_path.clone();
-            match model_path {
-                Some(path) => match state.engine.load_model(path) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        println!("Error loading model: {:?}", e);
-                    }
-                },
-                None => {
-                    state.engine.unload_model();
-                }
+                state.pitch_algorithm = new_pitch_algorithm;
+                reload_rvc = true;
             }
         }
 
@@ -598,23 +551,28 @@ impl UpdateSource for RvcInferenceFilter {
 
             state.input_buffer.fill(0_f32);
             state.input_buffer_16k.fill(0_f32);
-            {
-                let mut input = self.shared_state.input.lock();
-                input.clear();
-            }
-            {
-                let mut output = self.shared_state.output.lock();
-                output.clear();
-            }
 
-            // TODO: update resampler
+
+        }
+    
+        if reload_rvc {
+            let binary_path = unsafe { BINARY_PATH.as_ref().unwrap().parent().unwrap().join("rvc.exe") };
+            let infer_data_path = unsafe { DATA_PATH.as_ref().unwrap() }.join("rvcinfer");
+
+            let rvc = match state.model_path.clone() {
+                Some(path) => Some(RvcInfer::new(binary_path, state.model_version, state.pitch_algorithm, path, infer_data_path)),
+                None => None,
+            };
+
+            state.engine = rvc;
+        
         }
     }
 }
 
 impl FilterAudioSource for RvcInferenceFilter {
     fn filter_audio(&mut self, audio: &mut audio::AudioDataContext) -> FilterAudioResult {
-        self.start_thread();
+        // self.start_thread();
 
         let timestamp = audio.timestamp();
         let main_channel = downmix_to_mono(audio, self.shared_state.channels).unwrap();
@@ -657,6 +615,7 @@ impl FilterAudioSource for RvcInferenceFilter {
 
 impl ActivateSource for RvcInferenceFilter {
     fn activate(&mut self) {
+        self.clear_state();
         self.start_thread();
     }
 }
@@ -664,6 +623,7 @@ impl ActivateSource for RvcInferenceFilter {
 impl DeactivateSource for RvcInferenceFilter {
     fn deactivate(&mut self) {
         self.stop_thread();
+        self.clear_state();
     }
 }
 
@@ -704,35 +664,44 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
 
     println!("input: {:?}", input_buffer_16k_view);
 
+    let skip_head = (state.extra_frame_size / (state.sample_rate / 100)) as u32;
+
     // inference
-    let output = match state.engine.infer(
-        input_buffer_16k_view,
-        state.sample_frame_16k_size,
-        Some(state.pitch_shift),
-    ) {
-        Ok(output) => {
-            let skip_head = state.extra_frame_size / (state.sample_rate / 100);
-            let flow_head = if skip_head > 24 { skip_head - 24 } else { 0 };
-            let dec_head = skip_head - flow_head;
-            let end = state.model_return_size + dec_head;
-            output.slice(s![dec_head..end]).to_owned()
-        },
-        Err(e) => {
-            println!("Error: {:?}", e);
-            return ndarray::Array1::zeros(state.sample_frame_size);
+    let output = if let Some(engine) = state.engine.as_mut() {
+        match engine.infer(
+            input_buffer_16k_view,
+            state.sample_frame_16k_size,
+            state.pitch_shift,
+            skip_head,
+            state.model_return_size as u32
+        ) {
+            Ok(output) => {
+                output
+                // let skip_head = state.extra_frame_size / (state.sample_rate / 100);
+                // let flow_head = if skip_head > 24 { skip_head - 24 } else { 0 };
+                // let dec_head = skip_head - flow_head;
+                // let end = state.model_return_size + dec_head;
+                // output.slice(s![dec_head..end]).to_owned()
+            },
+            Err(e) => {
+                println!("Error: {:?}", e);
+                return ndarray::Array1::zeros(state.sample_frame_size);
+            }
         }
+    } else {
+        return ndarray::Array1::zeros(state.sample_frame_size);
     };
 
     println!("output: {:?}", output);
 
-    if output.len() != state.model_return_size {
-        println!(
-            "Model output size mismatch: {} != {}",
-            output.len(),
-            state.model_return_size
-        );
-        return ndarray::Array1::zeros(state.sample_frame_size);
-    }
+    // if output.len() != state.model_return_size {
+    //     println!(
+    //         "Model output size mismatch: {} != {}",
+    //         output.len(),
+    //         state.model_return_size
+    //     );
+    //     return ndarray::Array1::zeros(state.sample_frame_size);
+    // }
 
     let mut output = {
         let output = output.into_raw_vec();
@@ -831,6 +800,7 @@ fn thread_loop(shared_state: Arc<RvcInferenceSharedState>) {
 impl RvcInferenceFilter {
     fn start_thread(&mut self) {
         if self.thread_handle.is_none() {
+            eprintln!("Starting thread...");
             self.shared_state.running.store(true, std::sync::atomic::Ordering::Relaxed);
             let shared_state = self.shared_state.clone();
             let handle = std::thread::spawn(move || thread_loop(shared_state));
@@ -840,6 +810,7 @@ impl RvcInferenceFilter {
 
     fn stop_thread(&mut self) {
         if let Some(handle) = self.thread_handle.take() {
+            eprintln!("Stopping thread...");
             self.shared_state
                 .running
                 .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -851,6 +822,20 @@ impl RvcInferenceFilter {
             }
         }
     }
+
+    fn clear_state(&mut self) {
+        let mut state = self.shared_state.state.lock();
+        let mut input = self.shared_state.input.lock();
+        let mut output = self.shared_state.output.lock();
+        let mut timestamps = self.shared_state.timestamps.lock();
+        state.input_buffer.fill(0_f32);
+        state.input_buffer_16k.fill(0_f32);
+        state.sola_buffer.fill(0_f32);
+        state.output_buffer.fill(0_f32);
+        input.clear();
+        output.clear();
+        timestamps.clear();
+    }
 }
 
 impl Drop for RvcInferenceFilter {
@@ -861,28 +846,10 @@ impl Drop for RvcInferenceFilter {
 
 impl Module for RvcInferenceModule {
     fn new(context: ModuleRef) -> Self {
-        set_thread_panic_hook();
-
-        tracing_subscriber::fmt::init();
 
         let binary_path = PathBuf::from(context.binary_path().unwrap().as_str());
         let data_path = PathBuf::from(context.data_path().unwrap().as_str());
 
-        let dll_path = binary_path.parent().unwrap();
-        {
-            let dll_path_str = dll_path.to_string_lossy().replace("/", "\\");
-            let path = std::env::var("PATH").unwrap_or_default();
-            let new_path = format!("{};{}", dll_path_str, path);
-            std::env::set_var("PATH", new_path);
-        }
-
-        let ort_path = dll_path.join("onnxruntime.dll");
-        match ort::init_from(ort_path.to_string_lossy()).commit() {
-            Ok(_) => (),
-            Err(e) => {
-                println!("Error loading onnxruntime: {:?}", e);
-            }
-        }
 
         unsafe {
             BINARY_PATH = Some(binary_path);

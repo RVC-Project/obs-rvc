@@ -1,12 +1,12 @@
 use std::{collections::HashMap, mem::MaybeUninit};
 
-use mel_spec::{mel};
+use mel_spec::mel;
 use ndarray::{azip, s, Axis, CowArray, Zip};
 use ndarray_stats::QuantileExt;
 use num_complex::{Complex, Complex32, Complex64};
 use rustfft::{num_traits::Zero, FftPlanner};
 
-use crate::rvc::errors::RvcInferError;
+use rvc_common::errors::RvcInferError;
 
 
 pub struct Rmvpe {
