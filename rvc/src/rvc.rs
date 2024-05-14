@@ -98,6 +98,18 @@ impl RvcInfer {
         Ok(hubert.permuted_axes([0, 2, 1]).to_owned())
     }
 
+    pub fn extract_feature(&self, input: ndarray::ArrayView1<f32>) -> Result<ndarray::Array3<f32>, RvcInferError> {
+        let raw_hubert = self.hubert(input)?;
+        let extended_hubert_shape = {
+            let raw_h = raw_hubert.shape();
+            [raw_h[0], raw_h[1], raw_h[2] * 2 + 1]
+        };
+        let max_k = raw_hubert.len_of(Axis(2)) - 1;
+        Ok(ndarray::Array3::from_shape_fn(extended_hubert_shape, 
+            |(i, j, k)| raw_hubert[[i, j, usize::min(k / 2, max_k)]]
+        ).permuted_axes([0, 2, 1]))
+    }
+
     pub fn pitch(
         &mut self,
         input: ndarray::ArrayView1<f32>,
@@ -130,20 +142,12 @@ impl RvcInfer {
             return Err(RvcInferError::ModelNotLoaded);
         }
 
-        // let hubert_output = self.hubert(input)?;
-        let hubert_output = {
-            let raw_hubert = self.hubert(input)?;
-            let extended_hubert_shape = {
-                let raw_h = raw_hubert.shape();
-                [raw_h[0], raw_h[1], raw_h[2] * 2 + 1]
-            };
-            let max_k = raw_hubert.len_of(Axis(2)) - 1;
-            ndarray::Array3::from_shape_fn(extended_hubert_shape, 
-                |(i, j, k)| raw_hubert[[i, j, usize::min(k / 2, max_k)]]
-            ).permuted_axes([0, 2, 1])
-        };
+        let start_time = std::time::Instant::now();
 
-        let hubert_length = input.len() / 160;
+        // let hubert_output = self.hubert(input)?;
+        let hubert_output = self.extract_feature(input)?;
+
+        let hubert_length = usize::min(input.len() / 160, hubert_output.len_of(Axis(1)));
         let hubert_output = hubert_output.slice(s![.., ..hubert_length, ..]);
         // let hubert_length = hubert_output.len_of(Axis(1));
         // let hubert_length_arr = ndarray::Array1::from_elem(1, hubert_length as i64);
@@ -204,6 +208,8 @@ impl RvcInfer {
             // .remove_axis(Axis(0))
             .to_owned();
             // .mapv(|x| x * 32767.0f32);
+
+        eprintln!("Inference time: {:?}", start_time.elapsed());
 
         Ok(out)
     }

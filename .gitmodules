@@ -1,3 +1,6 @@
 [submodule "vendor/obs-wrapper"]
 	path = vendor/obs-wrapper
 	url = git@github.com:wfjsw/rust-obs-plugins.git
+[submodule "vendor/mel-spec"]
+	path = vendor/mel-spec
+	url = https://github.com/wavey-ai/mel-spec

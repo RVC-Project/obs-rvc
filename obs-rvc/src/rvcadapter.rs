@@ -103,12 +103,8 @@ impl RvcInfer {
         stdout.read_exact(&mut output_bytes_length)?;
         let output_bytes_length = u32::from_le_bytes(output_bytes_length) as usize;
 
-        println!("output_bytes_length: {}", output_bytes_length);
-
         let mut output_bytes = vec![0u8; output_bytes_length];
         stdout.read_exact(&mut output_bytes)?;
-
-        println!("read from stdout");
 
         // Convert output bytes to array
         let output_iter = output_bytes
@@ -118,13 +114,7 @@ impl RvcInfer {
                 bytes.copy_from_slice(chunk);
                 f32::from_le_bytes(bytes)
             });
-
-        println!("converted to f32");
-
         let output_array = Array1::from_iter(output_iter);
-
-        println!("converted to array");
-
         Ok(output_array)
     }
 }

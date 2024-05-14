@@ -53,11 +53,11 @@ fn main() {
         }
     }
 
-    let mut stdin = std::io::stdin().lock();
-    let mut stdout = std::io::stdout().lock();
+    let stdin = std::io::stdin().lock();
+    let stdout = std::io::stdout().lock();
 
     let mut buffered_stdin = std::io::BufReader::with_capacity(1024 * 1024, stdin);
-    let mut buffered_stdout = std::io::BufWriter::with_capacity(1024*1024, stdout);
+    let mut buffered_stdout = std::io::BufWriter::with_capacity(1024 * 1024, stdout);
 
     eprintln!("Ready to receive input");
 

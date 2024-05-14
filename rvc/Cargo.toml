@@ -9,10 +9,15 @@ edition = "2021"
 rvc-common = { path = "../rvc-common" }
 ort = { version = "2.0.0-rc.2", default-features = false }
 rustfft = "6.2.0"
-ndarray = { version = "0.15.6" }
+ndarray = { version = "0.15.6", features = ["approx-0_5"]}
 ndarray-conv = "0.3.3"
 rubato = "0.15.0"
-mel_spec = "0.2.2"
+mel_spec = { version = "0.2.2", path = "../vendor/mel-spec/mel_spec" }
 num-complex = "0.4.5"
 ndarray-stats = "0.5.1"
 ndarray-rand = "0.14.0"
+
+# for tests
+# ndarray-npy = "0.8.1"
+# ort = { version = "2.0.0-rc.2", features = ["download-binaries", "copy-dylibs", "half", "load-dynamic", "cuda", "tensorrt", "openvino", "directml"] }
+# approx = "0.5.1"

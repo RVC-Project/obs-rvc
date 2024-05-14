@@ -139,10 +139,13 @@ impl MelSpectrogram {
         n_mels: usize,
         win_length: usize,
         hop_length: usize,
+        f_min: Option<f64>,
+        f_max: Option<f64>,
         clamp: f32,
     ) -> Self {
         let mel_basis =
-            mel::mel(sample_rate as f64, fft_size, n_mels, true, true).mapv(|x| x as f32);
+            mel::mel(sample_rate as f64, fft_size, n_mels, f_min, f_max, true, true);
+        let mel_basis = mel_basis.mapv(|x| x as f32);
         MelSpectrogram {
             mel_basis,
             fft_size,
@@ -168,6 +171,7 @@ impl MelSpectrogram {
         let fft_size_new = (self.fft_size as f64 * factor).round() as usize;
         let win_length_new = (self.win_length as f64 * factor).round() as usize;
         let hop_length_new = self.hop_length * speed;
+
         if !self.hann_window_cache.contains_key(&keyshift) {
             self.hann_window_cache.insert(keyshift, get_hann_window_periodic(win_length_new));
         }
@@ -213,7 +217,7 @@ impl Rmvpe {
 
         Rmvpe {
             session: session,
-            mel_extractor: MelSpectrogram::new(1024, 16000, 128, 1024, 160, 1e-5),
+            mel_extractor: MelSpectrogram::new(1024, 16000, 128, 1024, 160, Some(30.0), Some(8000.0), 1e-5),
             cents_mapping,
         }
     }

@@ -2,6 +2,9 @@ mod ndarray_ext;
 mod rt_utils;
 mod rvcadapter;
 
+#[cfg(test)]
+mod tests;
+
 use ndarray::{s, ArrayView1};
 use parking_lot::{Condvar, FairMutex, Mutex};
 use rt_utils::{envelop_mixing, get_sola_offset, upmix_audio_data_context};
@@ -13,7 +16,7 @@ use obs_wrapper::{
     media::audio,
     obs_register_module, obs_string,
     prelude::*,
-    properties::{NumberProp, PathProp, PathType, Properties},
+    properties::{BoolProp, NumberProp, PathProp, PathType, Properties},
     source::*,
 };
 
@@ -23,12 +26,12 @@ use std::{
     f32::consts::PI,
     panic,
     path::PathBuf,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{atomic::{AtomicBool, AtomicUsize}, Arc},
     thread::JoinHandle,
     time::{self, Duration, Instant},
 };
 
-use crate::rt_utils::downmix_to_mono;
+use crate::{rt_utils::downmix_to_mono, rvcadapter::RvcAdapterError};
 
 static mut BINARY_PATH: Option<PathBuf> = None;
 static mut DATA_PATH: Option<PathBuf> = None;
@@ -89,6 +92,7 @@ const SETTING_FADE_LENGTH: ObsString = obs_string!("fade_length");
 const SETTING_EXTRA_INFERENCE_TIME: ObsString = obs_string!("extra_inference_time");
 const SETTING_DEST_SAMPLE_RATE: ObsString = obs_string!("dest_sample_rate");
 const SETTING_MODEL_VERSION: ObsString = obs_string!("model_version");
+const SETTING_SKIP_INFERENCE: ObsString = obs_string!("skip_inference");
 
 struct RvcInferenceState {
     model_path: Option<PathBuf>,
@@ -123,19 +127,12 @@ struct RvcInferenceState {
     fade_in_window: ndarray::Array1<f32>,
     fade_out_window: ndarray::Array1<f32>,
 
+    skip_inference: bool,
+
     upsampler: FftFixedInOut<f32>,
     downsampler: FftFixedInOut<f32>,
 
     engine: Option<RvcInfer>,
-}
-
-fn set_thread_panic_hook() {
-    use std::panic::{set_hook, take_hook};
-    let orig_hook = take_hook();
-    set_hook(Box::new(move |panic_info| {
-        println!("Panic: {:?}", panic_info);
-        orig_hook(panic_info);
-    }));
 }
 
 struct RvcInferenceSharedState {
@@ -147,6 +144,7 @@ struct RvcInferenceSharedState {
     timestamps: Mutex<VecDeque<u64>>,
     has_input: Condvar,
     buffer_changed: AtomicBool,
+    sample_frame_size: AtomicUsize,
 }
 
 struct RvcInferenceFilter {
@@ -185,8 +183,9 @@ impl Sourceable for RvcInferenceFilter {
         settings.set_default::<RvcModelVersion>(SETTING_MODEL_VERSION, RvcModelVersion::V2);
         settings
             .set_default::<PitchAlgorithm>(SETTING_PITCH_ALGORITHM, PitchAlgorithm::Rmvpe);
+        settings.set_default::<bool>(SETTING_SKIP_INFERENCE, false);
 
-        let model_output_sample_rate = settings.get(SETTING_DEST_SAMPLE_RATE).unwrap_or(40000);
+        let mut model_output_sample_rate = settings.get(SETTING_DEST_SAMPLE_RATE).unwrap_or(40000);
         let sample_length = settings.get(SETTING_SAMPLE_LENGTH).unwrap_or(0.30);
         let crossfade_length = settings.get(SETTING_FADE_LENGTH).unwrap_or(0.07);
         let extra_inference_time = settings.get(SETTING_EXTRA_INFERENCE_TIME).unwrap_or(2.00);
@@ -196,6 +195,8 @@ impl Sourceable for RvcInferenceFilter {
         let pitch_algorithm = settings
             .get(SETTING_PITCH_ALGORITHM)
             .unwrap_or(PitchAlgorithm::Rmvpe);
+
+        let skip_inference = settings.get(SETTING_SKIP_INFERENCE).unwrap_or(false);
 
         let zc = sample_rate / 100;
 
@@ -219,7 +220,12 @@ impl Sourceable for RvcInferenceFilter {
 
         let model_return_length =
             (sample_frame_size + sola_buffer_frame_size + sola_search_frame_size) / zc;
-        let model_return_size = model_return_length * (model_output_sample_rate / 100);
+        let mut model_return_size = model_return_length * (model_output_sample_rate / 100);
+
+        if skip_inference {
+            model_output_sample_rate = 16000;
+            model_return_size = model_return_length * 160;
+        }
 
         let sola_buffer = ndarray::Array1::zeros(sola_buffer_frame_size);
 
@@ -227,15 +233,15 @@ impl Sourceable for RvcInferenceFilter {
         fade_in_window.mapv_inplace(|x| f32::sin(x * 0.5 * PI).powi(2));
         let fade_out_window = fade_in_window.mapv(|x| 1.0 - x);
 
+        // 48k => 16k sample frame size
+        let downsampler = FftFixedInOut::new(sample_rate, 16000, sample_frame_size, 1).unwrap();
+
         // model_sample_size => 48k
         let upsampler =
             FftFixedInOut::new(model_output_sample_rate, sample_rate, model_return_size, 1)
                 .unwrap();
 
         let output_buffer = vec![0_f32; upsampler.output_frames_max()];
-
-        // 48k => 16k sample frame size
-        let downsampler = FftFixedInOut::new(sample_rate, 16000, sample_frame_size, 1).unwrap();
 
         let binary_path = unsafe { BINARY_PATH.as_ref().unwrap().parent().unwrap().join("rvc.exe") };
         let infer_data_path = unsafe { DATA_PATH.as_ref().unwrap() }.join("rvcinfer");
@@ -278,6 +284,8 @@ impl Sourceable for RvcInferenceFilter {
             fade_in_window,
             fade_out_window,
 
+            skip_inference,
+
             upsampler,
             downsampler,
 
@@ -295,6 +303,7 @@ impl Sourceable for RvcInferenceFilter {
             timestamps: Mutex::new(VecDeque::with_capacity(sample_frame_size * 16)),
             has_input: Condvar::new(),
             buffer_changed: AtomicBool::new(false),
+            sample_frame_size: AtomicUsize::new(sample_frame_size),
         };
 
         let shared_state = Arc::new(shared_state);
@@ -405,6 +414,12 @@ impl GetPropertiesSource for RvcInferenceFilter {
                 .with_slider(),
         );
 
+        p.add(
+            SETTING_SKIP_INFERENCE,
+            obs_string!("跳过推理"),
+            BoolProp
+        );
+
         p
     }
 }
@@ -488,6 +503,13 @@ impl UpdateSource for RvcInferenceFilter {
             }
         }
 
+        if let Some(new_skip_inference) = settings.get(SETTING_SKIP_INFERENCE) {
+            if state.skip_inference != new_skip_inference {
+                state.skip_inference = new_skip_inference;
+                recalculate_input_buffer = true;
+            }
+        }
+
         if recalculate_input_buffer {
             self.shared_state
                 .buffer_changed
@@ -495,7 +517,7 @@ impl UpdateSource for RvcInferenceFilter {
             let sample_length = state.sample_length;
             let crossfade_length = state.crossfade_length;
             let extra_inference_time = state.extra_inference_time;
-            let model_output_sample_rate = state.model_output_sample_rate;
+            let mut model_output_sample_rate = state.model_output_sample_rate;
 
             // zc is sample per 0.1 sec
             let zc = sample_rate / 100;
@@ -512,7 +534,12 @@ impl UpdateSource for RvcInferenceFilter {
                 (extra_inference_time * sample_rate as f64 / zc as f64).round() as usize * zc;
             let model_return_length =
                 (sample_frame_size + sola_buffer_frame_size + sola_search_frame_size) / zc;
-            let model_return_size = model_return_length * (model_output_sample_rate / 100);
+            let mut model_return_size = model_return_length * (model_output_sample_rate / 100);
+
+            if state.skip_inference {
+                model_output_sample_rate = 16000;
+                model_return_size = model_return_length * 160;
+            }
 
             state.sample_frame_size = sample_frame_size;
             state.sample_frame_16k_size = sample_frame_16k;
@@ -522,6 +549,7 @@ impl UpdateSource for RvcInferenceFilter {
             state.extra_frame_size = extra_frame_size;
             state.model_return_length = model_return_length;
             state.model_return_size = model_return_size;
+            self.shared_state.sample_frame_size.store(sample_frame_size, std::sync::atomic::Ordering::Relaxed);
 
             let input_buffer_size = extra_frame_size
                 + crossfade_frame_size
@@ -556,16 +584,7 @@ impl UpdateSource for RvcInferenceFilter {
         }
     
         if reload_rvc {
-            let binary_path = unsafe { BINARY_PATH.as_ref().unwrap().parent().unwrap().join("rvc.exe") };
-            let infer_data_path = unsafe { DATA_PATH.as_ref().unwrap() }.join("rvcinfer");
-
-            let rvc = match state.model_path.clone() {
-                Some(path) => Some(RvcInfer::new(binary_path, state.model_version, state.pitch_algorithm, path, infer_data_path)),
-                None => None,
-            };
-
-            state.engine = rvc;
-        
+            Self::restart_rvc_engine_inner(&mut state);
         }
     }
 }
@@ -581,16 +600,26 @@ impl FilterAudioSource for RvcInferenceFilter {
         {
             let mut input = self.shared_state.input.lock();
             let mut timestamps = self.shared_state.timestamps.lock();
+
             main_channel
                 .iter()
                 .for_each(|sample| input.push_back(*sample));
             timestamps.push_back(timestamp);
+
+            let sample_frame_size = self.shared_state.sample_frame_size.load(std::sync::atomic::Ordering::Relaxed);
+
+            while input.len() > 2 * sample_frame_size {
+                input.drain(..frame_len);
+                timestamps.pop_front();
+            }
         }
 
         self.shared_state.has_input.notify_one();
 
         {
             let mut output = self.shared_state.output.lock();
+            let mut timestamps = self.shared_state.timestamps.lock();
+
             if output.len() < frame_len {
                 return FilterAudioResult::Discarded;
             }
@@ -601,7 +630,6 @@ impl FilterAudioSource for RvcInferenceFilter {
                 *channel_stream = output_stream;
             }
 
-            let mut timestamps = self.shared_state.timestamps.lock();
             if let Some(ts) = timestamps.pop_front() {
                 audio.set_timestamp(ts);
             }
@@ -662,18 +690,21 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
         ndarray::ArrayView1::from_shape((state.input_buffer_16k.len(),), &state.input_buffer_16k)
             .unwrap();
 
-    println!("input: {:?}", input_buffer_16k_view);
+    // println!("input: {:?}", input_buffer_16k_view);
 
     let skip_head = (state.extra_frame_size / (state.sample_rate / 100)) as u32;
 
     // inference
-    let output = if let Some(engine) = state.engine.as_mut() {
+    let output = if state.skip_inference {
+        let output_start = input_buffer_16k_view.len() - state.model_return_size;
+        input_buffer_16k_view.slice(s![output_start..]).to_owned()
+    } else if let Some(engine) = state.engine.as_mut() {
         match engine.infer(
             input_buffer_16k_view,
             state.sample_frame_16k_size,
             state.pitch_shift,
             skip_head,
-            state.model_return_size as u32
+            state.model_return_length as u32
         ) {
             Ok(output) => {
                 output
@@ -685,6 +716,14 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
             },
             Err(e) => {
                 println!("Error: {:?}", e);
+
+                match e {
+                    RvcAdapterError::IoError(e) => {
+                        RvcInferenceFilter::restart_rvc_engine_inner(state);
+                    },
+                    _ => (),
+                }
+
                 return ndarray::Array1::zeros(state.sample_frame_size);
             }
         }
@@ -692,16 +731,16 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
         return ndarray::Array1::zeros(state.sample_frame_size);
     };
 
-    println!("output: {:?}", output);
+    // println!("output: {:?}", output);
 
-    // if output.len() != state.model_return_size {
-    //     println!(
-    //         "Model output size mismatch: {} != {}",
-    //         output.len(),
-    //         state.model_return_size
-    //     );
-    //     return ndarray::Array1::zeros(state.sample_frame_size);
-    // }
+    if output.len() != state.model_return_size {
+        println!(
+            "Model output size mismatch: {} != {}",
+            output.len(),
+            state.model_return_size
+        );
+        // return ndarray::Array1::zeros(state.sample_frame_size);
+    }
 
     let mut output = {
         let output = output.into_raw_vec();
@@ -821,6 +860,23 @@ impl RvcInferenceFilter {
                 }
             }
         }
+    }
+
+    fn restart_rvc_engine(&mut self) {
+        let mut state = self.shared_state.state.lock();
+        Self::restart_rvc_engine_inner(&mut state);
+    }
+
+    fn restart_rvc_engine_inner(state: &mut RvcInferenceState) {
+        let binary_path = unsafe { BINARY_PATH.as_ref().unwrap().parent().unwrap().join("rvc.exe") };
+        let infer_data_path = unsafe { DATA_PATH.as_ref().unwrap() }.join("rvcinfer");
+
+        let rvc = match state.model_path.clone() {
+            Some(path) => Some(RvcInfer::new(binary_path, state.model_version, state.pitch_algorithm, path, infer_data_path)),
+            None => None,
+        };
+
+        state.engine = rvc;
     }
 
     fn clear_state(&mut self) {

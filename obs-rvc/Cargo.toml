@@ -16,6 +16,10 @@ mel_spec = "0.2.2"
 ndarray-stats = "0.5.1"
 ndarray-rand = "0.14.0"
 
+# for tests
+ndarray-npy = "0.8.1"
+ort = { version = "2.0.0-rc.2", features = ["download-binaries", "copy-dylibs", "half", "load-dynamic", "cuda", "tensorrt", "openvino", "directml"] }
+
 [lib]
 name = "obsrvc"
 crate-type = ["cdylib"]
