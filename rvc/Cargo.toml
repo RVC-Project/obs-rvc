@@ -21,3 +21,6 @@ ndarray-rand = "0.14.0"
 # ndarray-npy = "0.8.1"
 # ort = { version = "2.0.0-rc.2", features = ["download-binaries", "copy-dylibs", "half", "load-dynamic", "cuda", "tensorrt", "openvino", "directml"] }
 # approx = "0.5.1"
+
+[features]
+tensorrt = ["ort/tensorrt"]

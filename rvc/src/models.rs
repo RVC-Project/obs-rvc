@@ -5,34 +5,35 @@ use ort::*;
 use rvc_common::enums::PitchAlgorithm;
 
 fn get_onnx_session(cache_path: PathBuf, use_tensorrt: bool) -> Result<ort::SessionBuilder, ort::Error> {
+    #[cfg(feature = "tensorrt")]
     if use_tensorrt {
+        return Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_execution_providers([
+                TensorRTExecutionProvider::default()
+                    .with_timing_cache(true)
+                    .with_engine_cache(true)
+                    .with_fp16(true)
+                    .with_builder_optimization_level(5)
+                    .with_engine_cache_path(cache_path.to_string_lossy())
+                    .build(),
+                CUDAExecutionProvider::default()
+                    .with_copy_in_default_stream(false)
+                    .with_arena_extend_strategy(ArenaExtendStrategy::SameAsRequested)
+                    .build(),
+                CPUExecutionProvider::default().build(),
+            ]);
+    } 
+
     Session::builder()?
-        .with_optimization_level(GraphOptimizationLevel::Level3)?
-        .with_execution_providers([
-            TensorRTExecutionProvider::default()
-                .with_timing_cache(true)
-                .with_engine_cache(true)
-                .with_fp16(true)
-                .with_builder_optimization_level(5)
-                .with_engine_cache_path(cache_path.to_string_lossy())
-                .build(),
-            CUDAExecutionProvider::default()
-                .with_copy_in_default_stream(false)
-                .with_arena_extend_strategy(ArenaExtendStrategy::SameAsRequested)
-                .build(),
-            CPUExecutionProvider::default().build(),
-        ])
-    } else {
-        Session::builder()?
-        .with_optimization_level(GraphOptimizationLevel::Level3)?
-        .with_execution_providers([
-            CUDAExecutionProvider::default()
-                .with_copy_in_default_stream(false)
-                .with_arena_extend_strategy(ArenaExtendStrategy::SameAsRequested)
-                .build(),
-            CPUExecutionProvider::default().build(),
-        ])
-    }
+    .with_optimization_level(GraphOptimizationLevel::Level3)?
+    .with_execution_providers([
+        CUDAExecutionProvider::default()
+            .with_copy_in_default_stream(false)
+            .with_arena_extend_strategy(ArenaExtendStrategy::SameAsRequested)
+            .build(),
+        CPUExecutionProvider::default().build(),
+    ])
 
 }
 
