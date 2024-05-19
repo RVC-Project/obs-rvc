@@ -135,7 +135,7 @@ pub fn envelop_mixing(input: ArrayView1<f32>, output: ArrayViewMut1<f32>, sample
     let mix_power = 1.0f64 - mix_rate;
     Zip::from(output).and(rms1.slice(s![..output_len])).and(rms2.slice(s![..output_len]))
         .for_each(|out, rms1, rms2| {
-            *out = *out * (rms1 / rms2).powf(mix_power as f32);
+            *out = *out * (*rms1 / *rms2).powf(mix_power as f32);
         });
 }
 

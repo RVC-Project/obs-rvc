@@ -6,7 +6,7 @@ mod rvcadapter;
 mod tests;
 
 use crossbeam::{queue::ArrayQueue, sync::{Parker, Unparker}};
-use ndarray::{s, ArrayView1};
+use ndarray::{s, ArrayView1, Zip};
 use parking_lot::{Condvar, FairMutex, Mutex};
 use rt_utils::{envelop_mixing, get_sola_offset, upmix_audio_data_context};
 use rubato::{FftFixedInOut, Resampler};
@@ -14,7 +14,7 @@ use rvc_common::enums::{PitchAlgorithm, RvcModelVersion};
 use rvcadapter::RvcInfer;
 
 use obs_wrapper::{
-    media::audio,
+    media::{audio, AudioData},
     obs_register_module, obs_string,
     prelude::*,
     properties::{BoolProp, NumberProp, PathProp, PathType, Properties},
@@ -297,7 +297,7 @@ impl Sourceable for RvcInferenceFilter {
             running: AtomicBool::new(true),
             channels,
             input: ArrayQueue::new(250),
-            output: ArrayQueue::new(350),
+            output: ArrayQueue::new(250),
             buffer_changed: AtomicBool::new(false),
             sample_frame_size: AtomicUsize::new(sample_frame_size),
         };
@@ -589,9 +589,6 @@ impl UpdateSource for RvcInferenceFilter {
 impl FilterAudioSource for RvcInferenceFilter {
     fn filter_audio(&mut self, audio: &mut audio::AudioDataContext) -> FilterAudioResult {
         // self.start_thread();
-
-        let start_time = Instant::now();
-
         let timestamp = audio.timestamp();
         let main_channel = downmix_to_mono(audio, self.shared_state.channels).unwrap();
         
@@ -611,12 +608,29 @@ impl FilterAudioSource for RvcInferenceFilter {
             None => return FilterAudioResult::Discarded,
         };
 
+        let timestamp = output.timestamp;
         // assuming same length
-        main_channel.copy_from_slice(&output.data);
-        audio.set_timestamp(output.timestamp);
+        if output.data.len() < main_channel.len() {
+            let mut output_head = 0;
+            main_channel[output_head..output.data.len()].copy_from_slice(&output.data);
+            output_head += output.data.len();
+
+            while output_head < main_channel.len() {
+                let output = match self.shared_state.output.pop() {
+                    Some(frame) => frame,
+                    None => break,
+                };
+
+                main_channel[output_head..(output_head + output.data.len())].copy_from_slice(&output.data);
+                output_head += output.data.len();
+            }
+            
+        } else {
+            main_channel.copy_from_slice(&output.data);
+        }
+
+        audio.set_timestamp(timestamp);
         upmix_audio_data_context(audio, self.shared_state.channels).unwrap();
-        let elapsed = start_time.elapsed();
-        eprintln!("Elapsed: {:?}", elapsed);
         FilterAudioResult::Modified
     }
 }
@@ -645,7 +659,7 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
 
     // resample and set to 16k
 
-    {
+    let cso = {
         state
             .input_buffer_16k
             .copy_within(state.sample_frame_16k_size.., 0);
@@ -661,13 +675,14 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
         if let Err(e) = result {
             panic!("Error: {:?}", e);
         }
-    }
+        result.unwrap().1 + output_buffer_cap
+    };
 
     let input_buffer_view =
         ndarray::ArrayView1::from_shape((state.input_buffer.len(),), &state.input_buffer).unwrap();
 
     let input_buffer_16k_view =
-        ndarray::ArrayView1::from_shape((state.input_buffer_16k.len(),), &state.input_buffer_16k)
+        ndarray::ArrayView1::from_shape((cso,), &state.input_buffer_16k)
             .unwrap();
 
     // println!("input: {:?}", input_buffer_16k_view);
@@ -733,7 +748,8 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
         if let Err(e) = result {
             panic!("Error: {:?}", e);
         }
-        ndarray::ArrayViewMut1::from_shape((state.output_buffer.len(),), &mut state.output_buffer)
+        let (csi, cso) = result.unwrap();
+        ndarray::ArrayViewMut1::from_shape((cso,), &mut state.output_buffer)
             .unwrap()
     };
 
@@ -754,19 +770,19 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
         state.sola_search_frame_size,
     )
     .unwrap();
+    eprintln!("sola_offset: {}", sola_offset);
 
     let mut output = output.slice_mut(s![sola_offset..]);
 
     // TODO: phase vocoder
-    {
-        // output[..self.sola_buffer_frame_size] *= self.fade_in_window;
-        let mut output_sola_buffer_view = output.slice_mut(s![..state.sola_buffer_frame_size]);
+    Zip::from(output.slice_mut(s![..state.sola_buffer_frame_size]))
+        .and(state.fade_in_window.view())
+        .and(state.sola_buffer.view())
+        .and(state.fade_out_window.view())
+        .for_each(|output_sola_buffer_view, fade_in, sola, fade_out| {
+            *output_sola_buffer_view = *output_sola_buffer_view * fade_in + sola * fade_out;
+        });
 
-        output_sola_buffer_view *= &state.fade_in_window;
-
-        let sola_with_fadeout = state.sola_buffer.clone() * &state.fade_out_window;
-        output_sola_buffer_view += &sola_with_fadeout;
-    }
 
     // self.sola_buffer.assign(&output[self.sample_frame_size..(self.sample_frame_size + self.sola_buffer_frame_size)]);
     state.sola_buffer.assign(&output.slice(s![

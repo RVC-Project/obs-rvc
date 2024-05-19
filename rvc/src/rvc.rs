@@ -23,7 +23,6 @@ pub struct RvcInfer {
     f0_mel_min: f32,
     f0_mel_max: f32,
 
-    cache_pitch: ndarray::Array1<i32>,
     cache_pitchf: ndarray::Array1<f32>,
 }
 
@@ -40,7 +39,6 @@ impl RvcInfer {
             f0_algorithm: None,
             f0_mel_min,
             f0_mel_max,
-            cache_pitch: ndarray::Array1::zeros(1024),
             cache_pitchf: ndarray::Array1::zeros(1024),
         }
     }
@@ -115,7 +113,7 @@ impl RvcInfer {
         input: ndarray::ArrayView1<f32>,
         pitch_shift: i32,
         sample_frame_16k_size: usize,
-    ) -> Result<(ndarray::Array1<i32>, ndarray::Array1<f32>), RvcInferError> {
+    ) -> Result<(ndarray::Array1<f32>), RvcInferError> {
         // return pitch, pitchf
 
         let f0 = match &mut self.f0_algorithm {
@@ -127,7 +125,9 @@ impl RvcInfer {
             _ => unreachable!(),
         };
 
-        Ok(get_f0_post(f0, self.f0_mel_min, self.f0_mel_max))
+        Ok(f0)
+
+        // Ok(get_f0_post(f0, self.f0_mel_min, self.f0_mel_max))
     }
 
     pub fn infer(
@@ -143,12 +143,16 @@ impl RvcInfer {
         }
 
         let start_time = std::time::Instant::now();
+        
+        let skip_head = skip_head as usize;
+        let return_length = return_length as usize;
 
         // let hubert_output = self.hubert(input)?;
         let hubert_output = self.extract_feature(input)?;
 
         let hubert_length = usize::min(input.len() / 160, hubert_output.len_of(Axis(1)));
-        let hubert_output = hubert_output.slice(s![.., ..hubert_length, ..]);
+        // let hubert_output = hubert_output.slice(s![.., ..hubert_length, ..]);
+        let hubert_output = hubert_output.slice(s![.., skip_head..skip_head + return_length, ..]);
 
         let hubert_time = start_time.elapsed();
 
@@ -158,24 +162,23 @@ impl RvcInfer {
         // if f0
         let pitch_shift = pitch_shift.unwrap_or(0);
         let (pitch, pitchf) = {
-            let (pitch, pitchf) = self.pitch(input, pitch_shift, sample_frame_16k_size)?;
+            let pitchf = self.pitch(input, pitch_shift, sample_frame_16k_size)?;
 
-            let pitch_len = pitch.len();
+            let pitch_len = pitchf.len();
             let shift = sample_frame_16k_size / 160;
             
-            self.cache_pitch.copy_within(shift.., 0);
             self.cache_pitchf.copy_within(shift.., 0);
 
-            let cache_pitch_start = self.cache_pitch.len() + 4 - pitch_len;
+            let cache_pitch_start = self.cache_pitchf.len() + 4 - pitch_len;
 
-            self.cache_pitch.slice_mut(s![cache_pitch_start..]).assign(&pitch.slice(s![3..pitch_len - 1]));
             self.cache_pitchf.slice_mut(s![cache_pitch_start..]).assign(&pitchf.slice(s![3..pitch_len - 1]));
 
-            let cached_range_start = self.cache_pitch.len() - hubert_length;
-            (
-                self.cache_pitch.slice(s![cached_range_start..]).to_owned().insert_axis(Axis(0)), 
-                self.cache_pitchf.slice(s![cached_range_start..]).to_owned().insert_axis(Axis(0))
-            )
+            let cached_range_start = self.cache_pitchf.len() - hubert_length + skip_head;
+            let cached_range_end = cached_range_start + return_length;
+
+            let result_pitchf = self.cache_pitchf.slice(s![cached_range_start..cached_range_end]).to_owned();
+            let (pitch, pitchf) = get_f0_post(result_pitchf, self.f0_mel_min, self.f0_mel_max);
+            (pitch.insert_axis(Axis(0)), pitchf.insert_axis(Axis(0)))
         };
 
         let pitch_time = start_time.elapsed() - hubert_time;
@@ -184,8 +187,8 @@ impl RvcInfer {
         // let ds = ndarray::Array1::from_elem(1, ds as i32);
         // let rnd = ndarray::Array3::random((1, 192, hubert_length), Normal::from_mean_cv(0.0f32, 1.0f32).unwrap());
 
-        let skip_head = ndarray::Array1::from_elem(1, skip_head as i64);
-        let return_length = ndarray::Array1::from_elem(1, return_length as i64);
+        // let skip_head = ndarray::Array1::from_elem(1, skip_head as i64);
+        // let return_length = ndarray::Array1::from_elem(1, return_length as i64);
 
         let output = {
             let session = self.session.as_ref().unwrap();
@@ -196,8 +199,8 @@ impl RvcInfer {
                 "pitchf" => pitchf,
                 // "ds" => ds,
                 // "rnd" => rnd
-                "skip_head" => skip_head,
-                "max_len" => return_length,
+                // "skip_head" => skip_head,
+                // "max_len" => return_length,
             ]?)?
         };
 
