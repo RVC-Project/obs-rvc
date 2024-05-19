@@ -5,6 +5,7 @@ mod rvcadapter;
 #[cfg(test)]
 mod tests;
 
+use crossbeam::{queue::ArrayQueue, sync::{Parker, Unparker}};
 use ndarray::{s, ArrayView1};
 use parking_lot::{Condvar, FairMutex, Mutex};
 use rt_utils::{envelop_mixing, get_sola_offset, upmix_audio_data_context};
@@ -21,14 +22,7 @@ use obs_wrapper::{
 };
 
 use std::{
-    borrow::Cow,
-    collections::VecDeque,
-    f32::consts::PI,
-    panic,
-    path::PathBuf,
-    sync::{atomic::{AtomicBool, AtomicUsize}, Arc},
-    thread::JoinHandle,
-    time::{self, Duration, Instant},
+    borrow::Cow, cell::RefCell, collections::VecDeque, f32::consts::PI, panic, path::PathBuf, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}, thread::{yield_now, JoinHandle}, time::{self, Duration, Instant}
 };
 
 use crate::{rt_utils::downmix_to_mono, rvcadapter::RvcAdapterError};
@@ -94,6 +88,11 @@ const SETTING_DEST_SAMPLE_RATE: ObsString = obs_string!("dest_sample_rate");
 const SETTING_MODEL_VERSION: ObsString = obs_string!("model_version");
 const SETTING_SKIP_INFERENCE: ObsString = obs_string!("skip_inference");
 
+struct Frame {
+    data: Vec<f32>,
+    timestamp: u64,
+}
+
 struct RvcInferenceState {
     model_path: Option<PathBuf>,
     index_path: Option<PathBuf>,
@@ -139,10 +138,8 @@ struct RvcInferenceSharedState {
     state: FairMutex<RvcInferenceState>,
     running: AtomicBool,
     channels: usize,
-    input: Mutex<VecDeque<f32>>,
-    output: Mutex<VecDeque<f32>>,
-    timestamps: Mutex<VecDeque<u64>>,
-    has_input: Condvar,
+    input: ArrayQueue<Frame>,
+    output: ArrayQueue<Frame>,
     buffer_changed: AtomicBool,
     sample_frame_size: AtomicUsize,
 }
@@ -150,6 +147,7 @@ struct RvcInferenceSharedState {
 struct RvcInferenceFilter {
     thread_handle: Option<JoinHandle<()>>,
     shared_state: Arc<RvcInferenceSharedState>,
+    has_input: Option<Unparker>,
 }
 
 struct RvcInferenceModule {
@@ -243,7 +241,7 @@ impl Sourceable for RvcInferenceFilter {
 
         let output_buffer = vec![0_f32; upsampler.output_frames_max()];
 
-        let binary_path = unsafe { BINARY_PATH.as_ref().unwrap().parent().unwrap().join("rvc.exe") };
+        let binary_path = unsafe { BINARY_PATH.as_ref().unwrap().parent().unwrap().join("rvc-rpc.exe") };
         let infer_data_path = unsafe { DATA_PATH.as_ref().unwrap() }.join("rvcinfer");
 
         let rvc = match model_path.clone() {
@@ -298,10 +296,8 @@ impl Sourceable for RvcInferenceFilter {
             state,
             running: AtomicBool::new(true),
             channels,
-            input: Mutex::new(VecDeque::with_capacity(sample_frame_size * 16)),
-            output: Mutex::new(VecDeque::with_capacity(sample_frame_size * 16)),
-            timestamps: Mutex::new(VecDeque::with_capacity(sample_frame_size * 16)),
-            has_input: Condvar::new(),
+            input: ArrayQueue::new(250),
+            output: ArrayQueue::new(350),
             buffer_changed: AtomicBool::new(false),
             sample_frame_size: AtomicUsize::new(sample_frame_size),
         };
@@ -311,6 +307,7 @@ impl Sourceable for RvcInferenceFilter {
         Self {
             thread_handle: None,
             shared_state,
+            has_input: None,
         }
     }
 }
@@ -593,50 +590,33 @@ impl FilterAudioSource for RvcInferenceFilter {
     fn filter_audio(&mut self, audio: &mut audio::AudioDataContext) -> FilterAudioResult {
         // self.start_thread();
 
+        let start_time = Instant::now();
+
         let timestamp = audio.timestamp();
         let main_channel = downmix_to_mono(audio, self.shared_state.channels).unwrap();
+        
+        let frame = Frame {
+            data: main_channel.to_vec(),
+            timestamp,
+        };
 
-        let frame_len = main_channel.len();
-        {
-            let mut input = self.shared_state.input.lock();
-            let mut timestamps = self.shared_state.timestamps.lock();
+        self.shared_state.input.force_push(frame);
 
-            main_channel
-                .iter()
-                .for_each(|sample| input.push_back(*sample));
-            timestamps.push_back(timestamp);
-
-            let sample_frame_size = self.shared_state.sample_frame_size.load(std::sync::atomic::Ordering::Relaxed);
-
-            while input.len() > 2 * sample_frame_size {
-                input.drain(..frame_len);
-                timestamps.pop_front();
-            }
+        if let Some(has_input) = self.has_input.as_ref() {
+            has_input.unpark();
         }
 
-        self.shared_state.has_input.notify_one();
+        let output = match self.shared_state.output.pop() {
+            Some(frame) => frame,
+            None => return FilterAudioResult::Discarded,
+        };
 
-        {
-            let mut output = self.shared_state.output.lock();
-            let mut timestamps = self.shared_state.timestamps.lock();
-
-            if output.len() < frame_len {
-                return FilterAudioResult::Discarded;
-            }
-
-            for (channel_stream, output_stream) in
-                main_channel.iter_mut().zip(output.drain(..frame_len))
-            {
-                *channel_stream = output_stream;
-            }
-
-            if let Some(ts) = timestamps.pop_front() {
-                audio.set_timestamp(ts);
-            }
-        }
-
+        // assuming same length
+        main_channel.copy_from_slice(&output.data);
+        audio.set_timestamp(output.timestamp);
         upmix_audio_data_context(audio, self.shared_state.channels).unwrap();
-
+        let elapsed = start_time.elapsed();
+        eprintln!("Elapsed: {:?}", elapsed);
         FilterAudioResult::Modified
     }
 }
@@ -797,42 +777,67 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
     output.slice(s![..state.sample_frame_size]).into_owned()
 }
 
-fn thread_loop(shared_state: Arc<RvcInferenceSharedState>) {
+fn thread_loop(shared_state: Arc<RvcInferenceSharedState>, has_input: Parker) {
     let mut input_sample: Vec<f32> = {
         let state = shared_state.state.lock();
-        Vec::with_capacity(state.sample_frame_size)
+        Vec::with_capacity(state.sample_frame_size * 2)
     };
+
+    let mut output_sample: Vec<f32> = Vec::with_capacity(input_sample.capacity());
+
+    let mut frame_buffer: VecDeque<Frame> = VecDeque::with_capacity(300);
 
     while shared_state
         .running
         .load(std::sync::atomic::Ordering::Relaxed)
     {
-        let state = shared_state.state.try_lock();
-        if state.is_none() {
-            continue;
-        }
-        let mut state = state.unwrap();
-        input_sample.clear();
-        let sample_frame_size = state.sample_frame_size;
-        {
-            let mut input = shared_state.input.lock();
-            if input.len() < sample_frame_size {
-                shared_state.has_input.wait_while_for(
-                    &mut input,
-                    |i| i.len() < sample_frame_size,
-                    Duration::from_millis(500),
-                );
+        let mut state = match shared_state.state.try_lock() {
+            Some(state) => state,
+            None => {
                 continue;
             }
-            input_sample.extend(input.drain(..sample_frame_size));
+        };
+
+        let sample_frame_size = state.sample_frame_size;
+        while input_sample.len() < sample_frame_size {
+            let frame = shared_state.input.pop();
+            if let Some(frame) = frame {
+                input_sample.extend_from_slice(&frame.data);
+                frame_buffer.push_back(frame);
+            } else {
+                has_input.park_timeout(Duration::from_secs(2));
+                if !shared_state
+                    .running
+                    .load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+            }
         }
-        let output_frame = process_one_frame(&input_sample, &mut state);
-        {
-            let mut output = shared_state.output.lock();
-            output_frame
-                .iter()
-                .for_each(|sample| output.push_back(*sample));
+
+        let output_frame = process_one_frame(&input_sample[..sample_frame_size], &mut state);
+        output_sample.extend_from_slice(&output_frame.as_slice().unwrap());
+
+        let mut output_head = 0;
+        while let Some(mut frame) = frame_buffer.pop_front() {
+            let frame_len = frame.data.len();
+            if output_head + frame_len >= output_sample.len() {
+                frame_buffer.push_front(frame);
+                break;
+            }
+            let output = &output_sample[output_head..output_head + frame_len];
+            frame.data.copy_from_slice(output);
+            let res = shared_state.output.force_push(frame);
+            if res.is_some() {
+                eprintln!("Output queue full, dropping frame");
+            }
+            output_head += frame_len;
         }
+        
+        input_sample.copy_within(sample_frame_size.., 0);
+        input_sample.truncate(input_sample.len() - sample_frame_size);
+        output_sample.copy_within(output_head.., 0);
+        output_sample.truncate(output_sample.len() - output_head);
+
     }
 }
 
@@ -842,8 +847,11 @@ impl RvcInferenceFilter {
             eprintln!("Starting thread...");
             self.shared_state.running.store(true, std::sync::atomic::Ordering::Relaxed);
             let shared_state = self.shared_state.clone();
-            let handle = std::thread::spawn(move || thread_loop(shared_state));
+            let parker = Parker::new();
+            let unparker = parker.unparker().clone();
+            let handle = std::thread::spawn(move || thread_loop(shared_state, parker));
             self.thread_handle.replace(handle);
+            self.has_input.replace(unparker);
         }
     }
 
@@ -853,6 +861,7 @@ impl RvcInferenceFilter {
             self.shared_state
                 .running
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.has_input.take();
             match handle.join() {
                 Ok(_) => (),
                 Err(e) => {
@@ -868,7 +877,7 @@ impl RvcInferenceFilter {
     }
 
     fn restart_rvc_engine_inner(state: &mut RvcInferenceState) {
-        let binary_path = unsafe { BINARY_PATH.as_ref().unwrap().parent().unwrap().join("rvc.exe") };
+        let binary_path = unsafe { BINARY_PATH.as_ref().unwrap().parent().unwrap().join("rvc-rpc.exe") };
         let infer_data_path = unsafe { DATA_PATH.as_ref().unwrap() }.join("rvcinfer");
 
         let rvc = match state.model_path.clone() {
@@ -881,16 +890,10 @@ impl RvcInferenceFilter {
 
     fn clear_state(&mut self) {
         let mut state = self.shared_state.state.lock();
-        let mut input = self.shared_state.input.lock();
-        let mut output = self.shared_state.output.lock();
-        let mut timestamps = self.shared_state.timestamps.lock();
         state.input_buffer.fill(0_f32);
         state.input_buffer_16k.fill(0_f32);
         state.sola_buffer.fill(0_f32);
         state.output_buffer.fill(0_f32);
-        input.clear();
-        output.clear();
-        timestamps.clear();
     }
 }
 

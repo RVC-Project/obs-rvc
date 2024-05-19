@@ -149,8 +149,8 @@ impl RvcInfer {
 
         let hubert_length = usize::min(input.len() / 160, hubert_output.len_of(Axis(1)));
         let hubert_output = hubert_output.slice(s![.., ..hubert_length, ..]);
-        // let hubert_length = hubert_output.len_of(Axis(1));
-        // let hubert_length_arr = ndarray::Array1::from_elem(1, hubert_length as i64);
+
+        let hubert_time = start_time.elapsed();
 
         // TODO: index search
         
@@ -178,8 +178,10 @@ impl RvcInfer {
             )
         };
 
-        let ds = 0;
-        let ds = ndarray::Array1::from_elem(1, ds as i32);
+        let pitch_time = start_time.elapsed() - hubert_time;
+
+        // let ds = 0;
+        // let ds = ndarray::Array1::from_elem(1, ds as i32);
         // let rnd = ndarray::Array3::random((1, 192, hubert_length), Normal::from_mean_cv(0.0f32, 1.0f32).unwrap());
 
         let skip_head = ndarray::Array1::from_elem(1, skip_head as i64);
@@ -192,7 +194,7 @@ impl RvcInfer {
                 // "phone_lengths" => hubert_length_arr, 
                 "pitch" => pitch,
                 "pitchf" => pitchf,
-                "ds" => ds,
+                // "ds" => ds,
                 // "rnd" => rnd
                 "skip_head" => skip_head,
                 "max_len" => return_length,
@@ -209,7 +211,7 @@ impl RvcInfer {
             .to_owned();
             // .mapv(|x| x * 32767.0f32);
 
-        eprintln!("Inference time: {:?}", start_time.elapsed());
+        eprintln!("hubert: {:?}, pitch: {:?}, inference: {:?}", hubert_time, pitch_time, start_time.elapsed() - pitch_time - hubert_time);
 
         Ok(out)
     }
