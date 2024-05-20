@@ -18,8 +18,10 @@ ndarray-rand = "0.14.0"
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel", "crossbeam-queue"] }
 
 # for tests
+# ndarray = { version = "0.15.6", features = ["approx-0_5"]}
 # ndarray-npy = "0.8.1"
-# ort = { version = "2.0.0-rc.2", features = ["download-binaries", "copy-dylibs", "half", "load-dynamic", "cuda", "tensorrt", "openvino", "directml"] }
+ort = { version = "2.0.0-rc.2", features = ["download-binaries", "copy-dylibs", "half", "load-dynamic", "cuda", "tensorrt", "openvino", "directml"] }
+# approx = "0.5.1"
 
 [lib]
 name = "obsrvc"

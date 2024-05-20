@@ -804,6 +804,7 @@ dependencies = [
  "ndarray-rand",
  "ndarray-stats",
  "obs-wrapper",
+ "ort",
  "parking_lot",
  "rubato",
  "rustfft 6.2.0",
@@ -1342,6 +1343,7 @@ dependencies = [
  "ort",
  "rvc",
  "rvc-common",
+ "tracing",
  "tracing-subscriber",
 ]
 

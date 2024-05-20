@@ -7,7 +7,7 @@ use rvc::RvcInfer;
 
 fn main() {
     #[cfg(debug_assertions)]
-    tracing_subscriber::fmt::fmt().with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt::fmt().with_max_level(tracing::Level::DEBUG).with_writer(std::io::stderr).init();
 
     let args: Vec<String> = env::args().collect();
 

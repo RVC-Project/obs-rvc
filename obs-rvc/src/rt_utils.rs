@@ -72,8 +72,7 @@ pub fn get_sola_offset(input_buffer: ndarray::ArrayView1<f32>, sola_buffer: ndar
     )?;
 
     let cor_den_filler = ndarray::Array3::<f32>::ones((1, 1, buffer_frame_size));
-    let conv_input_squared = conv_input.mapv(|x| x * x);
-    let mut cor_den = conv_input_squared.conv_fft(
+    let mut cor_den = conv_input.mapv(|x| x.powi(2)).conv_fft(
         &cor_den_filler, ndarray_conv::ConvMode::Valid, 
         ndarray_conv::PaddingMode::Zeros
     )?;
@@ -84,11 +83,12 @@ pub fn get_sola_offset(input_buffer: ndarray::ArrayView1<f32>, sola_buffer: ndar
     
     let cor_nom_1d = cor_nom.into_shape(cor_nom_len)?;
     let cor_den_1d = cor_den.into_shape(cor_den_len)?;
-    let cor = cor_nom_1d / cor_den_1d;
+    let cor = Zip::from(&cor_nom_1d).and(&cor_den_1d)
+        .map_collect(|&nom, &den| nom / den);
     let (idx_max, _val_max) =
         cor.indexed_iter()
             .fold((0, cor[0]), |(idx_max, val_max), (idx, val)| {
-                if &val_max > val {
+                if val_max > *val {
                     (idx_max, val_max)
                 } else {
                     (idx, *val)
@@ -98,7 +98,7 @@ pub fn get_sola_offset(input_buffer: ndarray::ArrayView1<f32>, sola_buffer: ndar
 }
 
 
-fn rms(y: ArrayView1<f32>, frame_length: usize, hop_length: usize) -> Array1<f32> {
+pub(crate) fn rms(y: ArrayView1<f32>, frame_length: usize, hop_length: usize) -> Array1<f32> {
     let padding = frame_length / 2;
     let y_padded = ndarray::concatenate![Axis(0), Array1::zeros(padding), y, Array1::zeros(padding)].mapv(|x| x.powi(2));
     let y_mean = y_padded
@@ -109,7 +109,7 @@ fn rms(y: ArrayView1<f32>, frame_length: usize, hop_length: usize) -> Array1<f32
     y_mean.collect()
 }
 
-fn linear_interpolate_align_corners(input: ArrayView1<f32>, size: usize) -> Array1<f32> {
+pub(crate) fn linear_interpolate_align_corners(input: ArrayView1<f32>, size: usize) -> Array1<f32> {
     let mut output = Array1::zeros(size);
     let step = (input.len() - 1) as f32 / (size - 1) as f32;
 

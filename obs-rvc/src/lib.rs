@@ -148,6 +148,7 @@ struct RvcInferenceFilter {
     thread_handle: Option<JoinHandle<()>>,
     shared_state: Arc<RvcInferenceSharedState>,
     has_input: Option<Unparker>,
+    filter_audio_lock: Mutex<()>,
 }
 
 struct RvcInferenceModule {
@@ -232,7 +233,8 @@ impl Sourceable for RvcInferenceFilter {
         let fade_out_window = fade_in_window.mapv(|x| 1.0 - x);
 
         // 48k => 16k sample frame size
-        let downsampler = FftFixedInOut::new(sample_rate, 16000, sample_frame_size, 1).unwrap();
+        let downsampler = FftFixedInOut::new(
+            sample_rate, 16000, sample_frame_size + 2 * zc, 1).unwrap();
 
         // model_sample_size => 48k
         let upsampler =
@@ -296,8 +298,8 @@ impl Sourceable for RvcInferenceFilter {
             state,
             running: AtomicBool::new(true),
             channels,
-            input: ArrayQueue::new(250),
-            output: ArrayQueue::new(250),
+            input: ArrayQueue::new(200),
+            output: ArrayQueue::new(300),
             buffer_changed: AtomicBool::new(false),
             sample_frame_size: AtomicUsize::new(sample_frame_size),
         };
@@ -308,6 +310,7 @@ impl Sourceable for RvcInferenceFilter {
             thread_handle: None,
             shared_state,
             has_input: None,
+            filter_audio_lock: Mutex::new(()),
         }
     }
 }
@@ -572,7 +575,7 @@ impl UpdateSource for RvcInferenceFilter {
             state.output_buffer.resize(output_buffer_size, 0_f32);
             // 48k => 16k sample frame size
             state.downsampler =
-                FftFixedInOut::new(sample_rate, 16000, sample_frame_size, 1).unwrap();
+                FftFixedInOut::new(sample_rate, 16000, sample_frame_size + 2 * zc, 1).unwrap();
 
             state.input_buffer.fill(0_f32);
             state.input_buffer_16k.fill(0_f32);
@@ -589,6 +592,7 @@ impl UpdateSource for RvcInferenceFilter {
 impl FilterAudioSource for RvcInferenceFilter {
     fn filter_audio(&mut self, audio: &mut audio::AudioDataContext) -> FilterAudioResult {
         // self.start_thread();
+        let _lock = self.filter_audio_lock.lock();
         let timestamp = audio.timestamp();
         let main_channel = downmix_to_mono(audio, self.shared_state.channels).unwrap();
         
@@ -659,30 +663,27 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
 
     // resample and set to 16k
 
-    let cso = {
-        state
-            .input_buffer_16k
-            .copy_within(state.sample_frame_16k_size.., 0);
+    state
+        .input_buffer_16k
+        .copy_within(state.sample_frame_16k_size.., 0);
 
-        let input_sample = &[input_sample];
-
-        let output_buffer_cap = state.input_buffer_16k.len() - state.sample_frame_16k_size;
-        let output_sample_buffer = &mut state.input_buffer_16k[output_buffer_cap..];
-        let output_sample = &mut [output_sample_buffer];
-        let result = state
-            .downsampler
-            .process_into_buffer(input_sample, output_sample, None);
-        if let Err(e) = result {
+    let downsample_start = state.input_buffer.len() - state.sample_frame_size - 2 * state.sample_rate / 100;
+    let input_sample = &[&state.input_buffer[downsample_start..]];
+    match state.downsampler.process(input_sample, None) {
+        Ok(result) => {
+            let copy_begin = state.input_buffer_16k.len() - (state.sample_frame_size / (state.sample_rate / 100) + 1) * 160;
+            state.input_buffer_16k[copy_begin..].copy_from_slice(&result[0][160..]);
+        },
+        Err(e) => {
             panic!("Error: {:?}", e);
         }
-        result.unwrap().1 + output_buffer_cap
     };
 
     let input_buffer_view =
         ndarray::ArrayView1::from_shape((state.input_buffer.len(),), &state.input_buffer).unwrap();
 
     let input_buffer_16k_view =
-        ndarray::ArrayView1::from_shape((cso,), &state.input_buffer_16k)
+        ndarray::ArrayView1::from_shape((state.input_buffer_16k.len(),), &state.input_buffer_16k)
             .unwrap();
 
     // println!("input: {:?}", input_buffer_16k_view);
@@ -710,7 +711,7 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
                 // output.slice(s![dec_head..end]).to_owned()
             },
             Err(e) => {
-                println!("Error: {:?}", e);
+                eprintln!("Error: {:?}", e);
 
                 match e {
                     RvcAdapterError::IoError(e) => {
@@ -726,10 +727,8 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
         return ndarray::Array1::zeros(state.sample_frame_size);
     };
 
-    // println!("output: {:?}", output);
-
     if output.len() != state.model_return_size {
-        println!(
+        eprintln!(
             "Model output size mismatch: {} != {}",
             output.len(),
             state.model_return_size
@@ -755,7 +754,7 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
 
     if state.rms_mix_rate < 1. {
         envelop_mixing(
-            ArrayView1::from(&state.input_buffer[state.extra_frame_size..]),
+            input_buffer_view.slice(s![state.extra_frame_size..]),
             output.view_mut(),
             state.sample_rate,
             state.rms_mix_rate,
@@ -764,13 +763,12 @@ fn process_one_frame(input_sample: &[f32], state: &mut RvcInferenceState) -> nda
 
     // sola
     let sola_offset = get_sola_offset(
-        input_buffer_view,
+        output.view(),
         state.sola_buffer.view(),
         state.sola_buffer_frame_size,
         state.sola_search_frame_size,
     )
     .unwrap();
-    eprintln!("sola_offset: {}", sola_offset);
 
     let mut output = output.slice_mut(s![sola_offset..]);
 
@@ -843,9 +841,6 @@ fn thread_loop(shared_state: Arc<RvcInferenceSharedState>, has_input: Parker) {
             let output = &output_sample[output_head..output_head + frame_len];
             frame.data.copy_from_slice(output);
             let res = shared_state.output.force_push(frame);
-            if res.is_some() {
-                eprintln!("Output queue full, dropping frame");
-            }
             output_head += frame_len;
         }
         
