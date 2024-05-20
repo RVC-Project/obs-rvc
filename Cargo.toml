@@ -3,3 +3,6 @@ resolver = "2"
 members = ["rvc", "obs-rvc", "rvc-rpc", "rvc-common"]
 # default-members = ["rvc", "obs-rvc", "rvc-rpc", "rvc-common"]
 exclude = ["vendor/obs-wrapper"]
+
+[profile.release]
+opt-level = 3

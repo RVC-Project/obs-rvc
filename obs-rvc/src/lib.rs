@@ -298,8 +298,8 @@ impl Sourceable for RvcInferenceFilter {
             state,
             running: AtomicBool::new(true),
             channels,
-            input: ArrayQueue::new(200),
-            output: ArrayQueue::new(300),
+            input: ArrayQueue::new(120),
+            output: ArrayQueue::new(200),
             buffer_changed: AtomicBool::new(false),
             sample_frame_size: AtomicUsize::new(sample_frame_size),
         };
@@ -591,8 +591,7 @@ impl UpdateSource for RvcInferenceFilter {
 
 impl FilterAudioSource for RvcInferenceFilter {
     fn filter_audio(&mut self, audio: &mut audio::AudioDataContext) -> FilterAudioResult {
-        // self.start_thread();
-        let _lock = self.filter_audio_lock.lock();
+        // self.start_thread()
         let timestamp = audio.timestamp();
         let main_channel = downmix_to_mono(audio, self.shared_state.channels).unwrap();
         
@@ -601,39 +600,43 @@ impl FilterAudioSource for RvcInferenceFilter {
             timestamp,
         };
 
-        self.shared_state.input.force_push(frame);
+        {
+            let _lock = self.filter_audio_lock.lock();
+            self.shared_state.input.force_push(frame);
 
-        if let Some(has_input) = self.has_input.as_ref() {
-            has_input.unpark();
-        }
+            if let Some(has_input) = self.has_input.as_ref() {
+                has_input.unpark();
+            }
 
-        let output = match self.shared_state.output.pop() {
-            Some(frame) => frame,
-            None => return FilterAudioResult::Discarded,
-        };
+            let output = match self.shared_state.output.pop() {
+                Some(frame) => frame,
+                None => return FilterAudioResult::Discarded,
+            };
 
-        let timestamp = output.timestamp;
-        // assuming same length
-        if output.data.len() < main_channel.len() {
-            let mut output_head = 0;
-            main_channel[output_head..output.data.len()].copy_from_slice(&output.data);
-            output_head += output.data.len();
-
-            while output_head < main_channel.len() {
-                let output = match self.shared_state.output.pop() {
-                    Some(frame) => frame,
-                    None => break,
-                };
-
-                main_channel[output_head..(output_head + output.data.len())].copy_from_slice(&output.data);
+            let timestamp = output.timestamp;
+            // assuming same length
+            if output.data.len() < main_channel.len() {
+                let mut output_head = 0;
+                main_channel[output_head..output.data.len()].copy_from_slice(&output.data);
                 output_head += output.data.len();
+
+                while output_head < main_channel.len() {
+                    let output = match self.shared_state.output.pop() {
+                        Some(frame) => frame,
+                        None => break,
+                    };
+
+                    main_channel[output_head..(output_head + output.data.len())].copy_from_slice(&output.data);
+                    output_head += output.data.len();
+                }
+                
+            } else {
+                main_channel.copy_from_slice(&output.data);
             }
             
-        } else {
-            main_channel.copy_from_slice(&output.data);
+            audio.set_timestamp(timestamp);
         }
 
-        audio.set_timestamp(timestamp);
         upmix_audio_data_context(audio, self.shared_state.channels).unwrap();
         FilterAudioResult::Modified
     }
@@ -801,7 +804,7 @@ fn thread_loop(shared_state: Arc<RvcInferenceSharedState>, has_input: Parker) {
 
     let mut frame_buffer: VecDeque<Frame> = VecDeque::with_capacity(300);
 
-    while shared_state
+    'frame_loop: while shared_state
         .running
         .load(std::sync::atomic::Ordering::Relaxed)
     {
@@ -819,14 +822,12 @@ fn thread_loop(shared_state: Arc<RvcInferenceSharedState>, has_input: Parker) {
                 input_sample.extend_from_slice(&frame.data);
                 frame_buffer.push_back(frame);
             } else {
-                has_input.park_timeout(Duration::from_secs(2));
-                if !shared_state
-                    .running
-                    .load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
+                has_input.park_timeout(Duration::from_secs(1));
+                continue 'frame_loop;
             }
         }
+         
+        let start_time = Instant::now();
 
         let output_frame = process_one_frame(&input_sample[..sample_frame_size], &mut state);
         output_sample.extend_from_slice(&output_frame.as_slice().unwrap());
@@ -840,7 +841,7 @@ fn thread_loop(shared_state: Arc<RvcInferenceSharedState>, has_input: Parker) {
             }
             let output = &output_sample[output_head..output_head + frame_len];
             frame.data.copy_from_slice(output);
-            let res = shared_state.output.force_push(frame);
+            shared_state.output.force_push(frame);
             output_head += frame_len;
         }
         
@@ -848,6 +849,9 @@ fn thread_loop(shared_state: Arc<RvcInferenceSharedState>, has_input: Parker) {
         input_sample.truncate(input_sample.len() - sample_frame_size);
         output_sample.copy_within(output_head.., 0);
         output_sample.truncate(output_sample.len() - output_head);
+
+        let elapsed = start_time.elapsed();
+        eprintln!("Thread Loop Elapsed: {:?}", elapsed);
 
     }
 }

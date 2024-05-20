@@ -113,7 +113,7 @@ impl RvcInfer {
         input: ndarray::ArrayView1<f32>,
         pitch_shift: i32,
         sample_frame_16k_size: usize,
-    ) -> Result<(ndarray::Array1<f32>), RvcInferError> {
+    ) -> Result<ndarray::Array1<f32>, RvcInferError> {
         // return pitch, pitchf
 
         let f0 = match &mut self.f0_algorithm {
