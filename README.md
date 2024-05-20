@@ -13,7 +13,7 @@ However, I need help on the following topics:
 I thought TensorRT would work, but it doesn't. It seems the ContentVec / RMVPE / model contains several
 operations that would force ONNXRuntime to do them in the CPU. At this point, I have no idea what to do next,
 and I don't know whether I should continuously use ONNX or not. After all, the DLL dependency of ONNXRuntime
-is not versioned correctly and it is a PITA combining it with other ML libraries.
+is not versioned correctly and it is a PITA combining it with other ML related plugins.
 
 I might be better off using [huggingface/candle](https://github.com/huggingface/candle) or Burn or Luminal, both performance-wise
 and ease of use. The ONNX is not delivering the performance I was looking for.
