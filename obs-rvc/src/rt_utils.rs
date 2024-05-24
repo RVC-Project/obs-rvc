@@ -61,29 +61,21 @@ pub fn get_sola_offset(input_buffer: ndarray::ArrayView1<f32>, sola_buffer: ndar
     buffer_frame_size: usize, search_frame_size: usize) -> Result<usize, Box<dyn std::error::Error>> {
     let conv_input_size = buffer_frame_size + search_frame_size;
     let conv_input = input_buffer
-        .slice(s![..conv_input_size])
-        .into_shape((1, 1, conv_input_size))?;
-    let sola_buffer_view = sola_buffer
-        .into_shape((1, 1, buffer_frame_size))?;
+        .slice(s![..conv_input_size]);
 
     let cor_nom = conv_input.conv_fft(
-        &sola_buffer_view, ndarray_conv::ConvMode::Valid, 
+        &sola_buffer, ndarray_conv::ConvMode::Valid, 
         ndarray_conv::PaddingMode::Zeros
     )?;
 
-    let cor_den_filler = ndarray::Array3::<f32>::ones((1, 1, buffer_frame_size));
+    let cor_den_filler = ndarray::Array1::<f32>::ones((buffer_frame_size));
     let mut cor_den = conv_input.mapv(|x| x.powi(2)).conv_fft(
         &cor_den_filler, ndarray_conv::ConvMode::Valid, 
         ndarray_conv::PaddingMode::Zeros
     )?;
     cor_den.mapv_inplace(|x| (x + 1e-8).sqrt());
 
-    let cor_nom_len = cor_nom.len();
-    let cor_den_len = cor_den.len();
-    
-    let cor_nom_1d = cor_nom.into_shape(cor_nom_len)?;
-    let cor_den_1d = cor_den.into_shape(cor_den_len)?;
-    let cor = Zip::from(&cor_nom_1d).and(&cor_den_1d)
+    let cor = Zip::from(&cor_nom).and(&cor_den)
         .map_collect(|&nom, &den| nom / den);
     let (idx_max, _val_max) =
         cor.indexed_iter()
